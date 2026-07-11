@@ -107,7 +107,7 @@ class ROS2Worker(QThread):
             self.sysid_calc = None
 
         # Subscribers and Timers
-        self.node.create_subscription(JointState, '/joint_states', self.joint_cb, 100)
+        self.node.create_subscription(JointState, '/joint_states', self.joint_cb, 200)
         
         # Delayed system initialization
         self.init_timer = self.node.create_timer(2.0, self.sys_ready)
@@ -116,6 +116,9 @@ class ROS2Worker(QThread):
         self.sysid_record_data = []
         self.sysid_start_ros_time = None
         self.sysid_q0_locked = [0.0] * 6
+
+        # Update rate
+        self.last_ui_update_time = 0.0
 
     def run(self):
         """Thread execution entry point."""
@@ -139,6 +142,8 @@ class ROS2Worker(QThread):
 
         with self.state_lock:
             self.last_state_rx_time = now_sec
+            
+            # Update joint states from the incoming JointState message
             for i, name in enumerate(self.joint_names):
                 if name in msg.name:
                     idx = msg.name.index(name)
@@ -146,30 +151,34 @@ class ROS2Worker(QThread):
                     self.dq_curr[i] = msg.velocity[idx] if len(msg.velocity) > idx else 0.0
                     self.tau_curr[i] = msg.effort[idx] if len(msg.effort) > idx else 0.0
 
-            # Forward Kinematics via Pinocchio
-            if hasattr(self, 'model'):
-                q_arr = np.array(self.q_curr)
-                pin.forwardKinematics(self.model, self.data, q_arr)
-                pin.updateFramePlacements(self.model, self.data)
-                se3 = self.data.oMf[self.eef_frame_id]
-                rpy_vec = pin.rpy.matrixToRpy(se3.rotation)
+            # [30Hz low frequency]：limits GUI updates to 30Hz to reduce CPU load
+            if now_sec - getattr(self, 'last_ui_update_time', 0.0) > 0.033:
                 
-                self.pose_curr = [
-                    se3.translation[0], se3.translation[1], se3.translation[2],
-                    rpy_vec[0], rpy_vec[1], rpy_vec[2]
-                ]
+                # Decrease frequency of forward kinematics computation to 30Hz for GUI updates
+                if hasattr(self, 'model'):
+                    q_arr = np.array(self.q_curr)
+                    pin.forwardKinematics(self.model, self.data, q_arr)
+                    pin.updateFramePlacements(self.model, self.data)
+                    se3 = self.data.oMf[self.eef_frame_id]
+                    rpy_vec = pin.rpy.matrixToRpy(se3.rotation)
+                    
+                    self.pose_curr = [
+                        se3.translation[0], se3.translation[1], se3.translation[2],
+                        rpy_vec[0], rpy_vec[1], rpy_vec[2]
+                    ]
 
-            # Pack telemetry for delivery to GUI thread
-            telemetry_packet = {
-                'q': list(self.q_curr),
-                'dq': list(self.dq_curr),
-                'tau': list(self.tau_curr),
-                'pose': list(self.pose_curr),
-                'timestamp': self.last_state_rx_time
-            }
-            self.telemetry_signal.emit(telemetry_packet)
+                # Pack telemetry data and emit signal to GUI thread
+                telemetry_packet = {
+                    'q': list(self.q_curr),
+                    'dq': list(self.dq_curr),
+                    'tau': list(self.tau_curr),
+                    'pose': list(self.pose_curr),
+                    'timestamp': self.last_state_rx_time
+                }
+                self.telemetry_signal.emit(telemetry_packet)
+                self.last_ui_update_time = now_sec
 
-        # Dynamic parameter data recording
+        # Record SysID Data if in SYSID_RUNNING state
         if self.state == Lite6StateMachine.SYSID_RUNNING:
             if self.sysid_start_ros_time is None:
                 self.sysid_start_ros_time = current_time
