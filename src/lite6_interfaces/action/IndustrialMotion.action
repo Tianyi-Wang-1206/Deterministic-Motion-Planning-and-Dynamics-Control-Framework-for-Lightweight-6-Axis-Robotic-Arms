@@ -1,0 +1,55 @@
+# ==========================================
+# 1. GOAL (客户端 -> 规划器 发送的请求)
+# ==========================================
+
+# 运动模式枚举
+uint8 MOVEJ = 0   # 关节空间点到点 (PTP)
+uint8 MOVEP = 1   # 笛卡尔空间点到点 (PTP, 走捷径, 姿态四元数Slerp插值)
+uint8 MOVEL = 2   # 笛卡尔空间直线 (TCP严格走直线)
+uint8 MOVEC = 3   # 笛卡尔空间圆弧 (需提供辅助途径点)
+
+uint8 command_type
+
+# 目标参数
+float64[6] joint_target          # 用于 MOVEJ: 6个关节目标角度 (弧度)
+geometry_msgs/Pose pose_target   # 用于 MOVEP/MOVEL/MOVEC: 目标位姿
+geometry_msgs/Pose pose_aux      # 用于 MOVEC: 圆弧轨迹的途径点(Auxiliary Point)
+
+# 全局运动学限制覆盖 (对应 GUI 上的滑动条, 0.01 ~ 1.0)
+float64 velocity_scale
+float64 acceleration_scale
+
+---
+# ==========================================
+# 2. RESULT (规划器 -> 客户端 返回的最终结果)
+# ==========================================
+
+# 工业级状态码定义
+int32 SUCCESS = 1
+int32 ERR_INVALID_INPUT = -1     # 参数不合法 (如 scale < 0)
+int32 ERR_NO_IK_SOLUTION = -2    # 目标点不可达 (无逆解)
+int32 ERR_LIMIT_VIOLATION = -3   # 目标点或插值过程超出关节物理极限
+int32 ERR_SINGULARITY = -4       # 轨迹经过奇异点 (|t19| < 1e-3)
+int32 ERR_QUADRANT_JUMP = -5     # MoveL/MoveC 期间发生象限突变 (强行变姿态)
+int32 ERR_RUCKIG_FAILED = -6     # Ruckig 轨迹生成/时间参数化失败
+int32 ERR_EXECUTION_ABORTED = -7 # 执行中途被 E-STOP 或新指令打断
+
+int32 error_code
+string error_string
+
+# 轨迹执行总耗时 (秒)
+float64 execution_time
+
+---
+# ==========================================
+# 3. FEEDBACK (规划器 -> 客户端 实时发送的进度)
+# ==========================================
+
+# 状态阶段枚举
+uint8 STATE_PLANNING = 0
+uint8 STATE_EXECUTING = 1
+
+uint8 current_state
+
+# 进度百分比 (0.0 ~ 100.0)
+float64 percent_complete
