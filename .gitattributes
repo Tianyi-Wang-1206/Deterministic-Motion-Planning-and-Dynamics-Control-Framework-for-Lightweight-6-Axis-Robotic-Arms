@@ -1,3 +1,2 @@
 mujoco-3.9.0/** linguist-vendored
-*.mw linguist-language=Maple
-*.mpl linguist-language=Maple
+*.mw linguist-language=Maple linguist-detectable=true
