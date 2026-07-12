@@ -5,6 +5,7 @@
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <shared_mutex>
+#include <string>
 
 // Include the action definition and kinematics engine header
 #include "lite6_interfaces/action/industrial_motion.hpp"
@@ -43,8 +44,14 @@ public:
         std::string limits_path = ament_index_cpp::get_package_share_directory("lite6_planner") + "/config/kinematic_limits.yaml";
 
         pinocchio::urdf::buildModel(urdf_path, pin_model_);
-        pin_data_ = pinocchio::Data(pin_model_);
         eef_frame_id_ = pin_model_.getFrameId("link_eef");
+        
+        // --- Register critical frames for global ground collision checks ---
+        critical_frames_.push_back(pin_model_.getFrameId("link3"));
+        critical_frames_.push_back(pin_model_.getFrameId("link4"));
+        critical_frames_.push_back(pin_model_.getFrameId("link5"));
+        critical_frames_.push_back(pin_model_.getFrameId("link6"));
+        critical_frames_.push_back(eef_frame_id_);
 
         if (!kin_engine_.load_limits(limits_path)) {
             RCLCPP_FATAL(this->get_logger(), "Failed to load kinematic limits!");
@@ -80,8 +87,8 @@ public:
 
 private:
     pinocchio::Model pin_model_;
-    pinocchio::Data pin_data_;
     pinocchio::FrameIndex eef_frame_id_;
+    std::vector<pinocchio::FrameIndex> critical_frames_;
     KinematicsEngine kin_engine_;
 
     Eigen::VectorXd current_q_;
@@ -97,6 +104,40 @@ private:
     rclcpp_action::Client<FJT>::SharedPtr jtc_client_;
     rclcpp_action::Server<IndustrialMotion>::SharedPtr action_server_;
 
+    // --- Ground Collision Helper Methods ---
+    
+    // Retrieves the minimum Z-height among all critical joints for a given configuration
+    double get_min_z_height(const Eigen::VectorXd& q) {
+        // Thread-safe local Pinocchio Data instance
+        pinocchio::Data local_data(pin_model_);
+        pinocchio::forwardKinematics(pin_model_, local_data, q);
+        pinocchio::updateFramePlacements(pin_model_, local_data);
+        
+        double min_z = std::numeric_limits<double>::max();
+        for (auto frame_id : critical_frames_) {
+            double z = local_data.oMf[frame_id].translation().z();
+            if (z < min_z) min_z = z;
+        }
+        return min_z;
+    }
+
+    // Checks an entire generated trajectory for mid-air "elbow drops" (sub-sampled for performance)
+    bool is_trajectory_safe_from_ground(const trajectory_msgs::msg::JointTrajectory& traj) {
+        if (traj.points.empty()) return true;
+        
+        // Sub-sample: Check every 10th point to save CPU
+        for (size_t i = 0; i < traj.points.size(); i += 10) {
+            Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(traj.points[i].positions.data(), 6);
+            if (get_min_z_height(q) < Z_MIN_THRESHOLD) return false;
+        }
+        // Always check the exact final point
+        Eigen::VectorXd q_end = Eigen::Map<const Eigen::VectorXd>(traj.points.back().positions.data(), 6);
+        if (get_min_z_height(q_end) < Z_MIN_THRESHOLD) return false;
+        
+        return true;
+    }
+
+
     // Action server callbacks
     rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID&, std::shared_ptr<const IndustrialMotion::Goal> goal) {
         if (goal->velocity_scale <= 0.0 || goal->velocity_scale > 1.0) return rclcpp_action::GoalResponse::REJECT;
@@ -104,7 +145,6 @@ private:
     }
 
     rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleMotion>&) {
-        // Cancel all goals if a cancel request is received
         jtc_client_->async_cancel_all_goals();
         return rclcpp_action::CancelResponse::ACCEPT;
     }
@@ -131,10 +171,22 @@ private:
                 throw std::runtime_error("Unknown Command Type");
             }
         } catch (const std::exception& e) {
-            result->error_code = IndustrialMotion::Result::ERR_NO_IK_SOLUTION;
-            result->error_string = e.what();
+            std::string err_msg = e.what();
+            
+            // --- Strict error categorization mapping ---
+            if (err_msg.find("GROUND_COLLISION") != std::string::npos) {
+                result->error_code = IndustrialMotion::Result::ERR_LIMIT_VIOLATION;
+            } else if (err_msg.find("NO_IK") != std::string::npos) {
+                result->error_code = IndustrialMotion::Result::ERR_NO_IK_SOLUTION;
+            } else if (err_msg.find("Singularity") != std::string::npos) {
+                result->error_code = IndustrialMotion::Result::ERR_SINGULARITY;
+            } else {
+                result->error_code = IndustrialMotion::Result::ERR_INVALID_INPUT;
+            }
+            
+            result->error_string = err_msg;
             goal_handle->abort(result);
-            RCLCPP_ERROR(this->get_logger(), "Planning Aborted: %s", e.what());
+            RCLCPP_ERROR(this->get_logger(), "Planning Aborted: %s", err_msg.c_str());
             return;
         }
 
@@ -142,72 +194,107 @@ private:
         send_to_jtc(traj_msg, goal_handle, result);
     }
 
-    // Parameterized PTP planning using Ruckig
+    // --- Parameterized PTP planning with multi-solution collision avoidance ---
     trajectory_msgs::msg::JointTrajectory plan_ptp(std::shared_ptr<const IndustrialMotion::Goal> goal)
     {
         // Safely copy current joint states
         Eigen::VectorXd start_q;
         {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_); // Acquire read lock
+            std::shared_lock<std::shared_mutex> lock(state_mutex_);
             start_q = current_q_;
         }
 
-        std::array<double, 6> q_target_arr;
-        
         if (goal->command_type == IndustrialMotion::Goal::MOVEJ) {
-            for(int i=0; i<6; ++i) q_target_arr[i] = goal->joint_target[i];
-        } else {
-            // MoveP: Turns the target pose into joint angles using optimal IK
+            // MOVEJ Logic
+            Eigen::VectorXd target_q_eig = Eigen::Map<const Eigen::VectorXd>(goal->joint_target.data(), 6);
+            
+            // Target check: Ensure target joint config doesn't smash the floor
+            if (get_min_z_height(target_q_eig) < Z_MIN_THRESHOLD) {
+                throw std::runtime_error("GROUND_COLLISION: Target joint configuration hits the ground!");
+            }
+            
+            // Generate Ruckig traj
+            auto traj = generate_ruckig_traj(start_q, target_q_eig, goal->velocity_scale, goal->acceleration_scale);
+            
+            // Mid-trajectory check
+            if (!is_trajectory_safe_from_ground(traj)) {
+                throw std::runtime_error("GROUND_COLLISION: Mid-trajectory hits the ground during MoveJ execution!");
+            }
+            return traj;
+        } 
+        else {
+            // MOVEP Logic
             Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
             
-            // Z-Axis limit check for PTP target
+            // Target check: Z-Axis limit check for PTP target
             if (T_goal(2,3) < Z_MIN_THRESHOLD) {
-                throw std::runtime_error("Z-Limit Violation! Target pose hits the safety floor.");
+                throw std::runtime_error("GROUND_COLLISION: Target pose hits the safety floor.");
             }
 
-            // Anti-Wrist Flip Logic: Check if target is already the current pose
-            pinocchio::forwardKinematics(pin_model_, pin_data_, start_q);
-            pinocchio::updateFramePlacements(pin_model_, pin_data_);
+            pinocchio::Data local_data(pin_model_);
+            pinocchio::forwardKinematics(pin_model_, local_data, start_q);
+            pinocchio::updateFramePlacements(pin_model_, local_data);
+            
             Eigen::Matrix4d T_current = Eigen::Matrix4d::Identity();
-            T_current.block<3,3>(0,0) = pin_data_.oMf[eef_frame_id_].rotation();
-            T_current.block<3,1>(0,3) = pin_data_.oMf[eef_frame_id_].translation();
+            T_current.block<3,3>(0,0) = local_data.oMf[eef_frame_id_].rotation();
+            T_current.block<3,1>(0,3) = local_data.oMf[eef_frame_id_].translation();
 
             double pos_err = (T_goal.block<3,1>(0,3) - T_current.block<3,1>(0,3)).norm();
             double ori_err = Eigen::AngleAxisd(T_current.block<3,3>(0,0).transpose() * T_goal.block<3,3>(0,0)).angle();
 
             if (pos_err < 1e-4 && std::abs(ori_err) < 1e-3) {
-                // Short-circuit IK: We are already at the target, maintain current joint angles exactly
-                Eigen::VectorXd::Map(&q_target_arr[0], 6) = start_q;
-                RCLCPP_INFO(this->get_logger(), "MoveP target identical to current pose. IK bypassed to prevent wrist-flip.");
-            } else {
-                // Normal IK Solving
-                std::array<double, 6> q_ref;
-                Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
-                
-                if (!kin_engine_.solve_optimal_ik(T_goal, q_ref, q_target_arr, false)) {
-                    throw std::runtime_error("IK Failed or Limits Violated for Target Pose.");
-                }
-            }
-        }
+                // Short-circuit IK: Already at target
+                return generate_ruckig_traj(start_q, start_q, goal->velocity_scale, goal->acceleration_scale);
+            } 
 
-        // Instantiate Ruckig for 6 DoF with a time step of 10ms
+            // Normal IK Solving - Requesting a Priority Queue of valid solutions
+            std::array<double, 6> q_ref;
+            Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
+            
+            std::vector<std::array<double, 6>> valid_ik_solutions;
+            if (!kin_engine_.solve_optimal_ik(T_goal, q_ref, valid_ik_solutions, false)) {
+                throw std::runtime_error("NO_IK_SOLUTION: Target is physically unreachable or outside limits.");
+            }
+
+            // --- Multi-solution iteration to avoid "Elbow Drops" ---
+            for (const auto& q_target_candidate : valid_ik_solutions) {
+                Eigen::VectorXd target_q_eig = Eigen::Map<const Eigen::VectorXd>(q_target_candidate.data(), 6);
+                
+                // Target is known to be IK-valid, generate its interpolation trajectory
+                auto traj = generate_ruckig_traj(start_q, target_q_eig, goal->velocity_scale, goal->acceleration_scale);
+                
+                // If it doesn't hit the ground mid-air, it's our golden ticket!
+                if (is_trajectory_safe_from_ground(traj)) {
+                    return traj;
+                }
+                
+                RCLCPP_WARN(this->get_logger(), "MoveP Priority IK Path hits ground. Rerouting to next sub-optimal IK solution...");
+            }
+            
+            throw std::runtime_error("GROUND_COLLISION: All possible IK routes result in an elbow drop or ground collision!");
+        }
+    }
+
+    // Helper: Extracts Ruckig generation logic for re-use
+    trajectory_msgs::msg::JointTrajectory generate_ruckig_traj(const Eigen::VectorXd& start_q, const Eigen::VectorXd& target_q, double v_scale, double a_scale) 
+    {
         double dt = 0.01;
         ruckig::Ruckig<6> otg(dt);
         ruckig::InputParameter<6> input;
         ruckig::OutputParameter<6> output;
 
         for (int i = 0; i < 6; ++i) {
-            input.current_position[i] = start_q[i]; // Use safe snapshot
+            input.current_position[i] = start_q[i];
             input.current_velocity[i] = 0.0;
             input.current_acceleration[i] = 0.0;
             
-            input.target_position[i] = q_target_arr[i];
+            input.target_position[i] = target_q[i];
             input.target_velocity[i] = 0.0;
             input.target_acceleration[i] = 0.0;
 
             const auto& lim = kin_engine_.get_joint_limits()[i];
-            input.max_velocity[i] = lim.max_vel * goal->velocity_scale;
-            input.max_acceleration[i] = lim.max_acc * goal->acceleration_scale;
+            input.max_velocity[i] = lim.max_vel * v_scale;
+            input.max_acceleration[i] = lim.max_acc * a_scale;
             input.max_jerk[i] = input.max_acceleration[i] * 10.0;
         }
 
@@ -228,7 +315,6 @@ private:
             output.pass_to_input(input);
         } while (res == ruckig::Result::Working);
 
-        // Guarantee that the last point has zero velocity and acceleration
         if (!traj.points.empty()) {
             for (int i = 0; i < 6; ++i) {
                 traj.points.back().velocities[i] = 0.0;
@@ -247,12 +333,18 @@ private:
             std::shared_lock<std::shared_mutex> lock(state_mutex_);
             start_q = current_q_;
         }
-
-        pinocchio::forwardKinematics(pin_model_, pin_data_, start_q);
-        pinocchio::updateFramePlacements(pin_model_, pin_data_);
-        pinocchio::SE3 pose_start = pin_data_.oMf[eef_frame_id_];
         
+        // Quick target check
         Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
+        if (T_goal(2,3) < Z_MIN_THRESHOLD) {
+            throw std::runtime_error("GROUND_COLLISION: Target pose hits the safety floor.");
+        }
+
+        pinocchio::Data local_data(pin_model_);
+        pinocchio::forwardKinematics(pin_model_, local_data, start_q);
+        pinocchio::updateFramePlacements(pin_model_, local_data);
+        pinocchio::SE3 pose_start = local_data.oMf[eef_frame_id_];
+        
         pinocchio::SE3 pose_end(T_goal.block<3,3>(0,0), T_goal.block<3,1>(0,3));
 
         double d_trans = (pose_end.translation() - pose_start.translation()).norm();
@@ -304,9 +396,6 @@ private:
                     // 1. Interpolation
                     Eigen::Vector3d p_t = pose_start.translation() + s * (pose_end.translation() - pose_start.translation());
                     
-                    // Z-Axis Anti-Collision
-                    if (p_t.z() < Z_MIN_THRESHOLD) throw std::runtime_error("Z-Limit Violation! Path hits the floor.");
-
                     Eigen::Quaterniond q_s(pose_start.rotation());
                     Eigen::Quaterniond q_e(pose_end.rotation());
                     Eigen::Matrix4d T_t = Eigen::Matrix4d::Identity();
@@ -314,19 +403,24 @@ private:
                     T_t.block<3,1>(0,3) = p_t;
 
                     // 2. Find IK solution for the interpolated pose
-                    std::array<double, 6> q_ik;
-                    if (!kin_engine_.solve_optimal_ik(T_t, q_ref, q_ik, true)) {
-                        throw std::runtime_error("Singularity or Quadrant Jump detected during MOVEL.");
+                    std::vector<std::array<double, 6>> valid_sols;
+                    if (!kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true)) {
+                        throw std::runtime_error("Singularity, No IK, or Quadrant Jump detected during MOVEL.");
                     }
-                    q_ref = q_ik;
+                    q_ref = valid_sols[0]; // Take the best continuous solution
+
+                    // --- Dynamic strict ground checking for aLL links ---
+                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
+                    if (get_min_z_height(q_eig) < Z_MIN_THRESHOLD) {
+                        throw std::runtime_error("GROUND_COLLISION: Interpolated path forces a link to hit the floor.");
+                    }
 
                     // 3. Derive joint velocities using Jacobian
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ik.data(), 6);
                     Eigen::Vector3d v_world = ds * (pose_end.translation() - pose_start.translation());
                     Eigen::Vector3d w_world = ds * d_rot * (pose_start.rotation() * aa.axis());
                     
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(pin_model_, pin_data_, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(pin_model_, local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
                     Eigen::VectorXd V_spatial(6);
                     V_spatial << v_world, w_world;
@@ -342,7 +436,7 @@ private:
 
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
-                        pt.positions.push_back(q_ik[i]);
+                        pt.positions.push_back(q_ref[i]);
                         pt.velocities.push_back(dq(i));
                         pt.accelerations.push_back(ddq(i));
                     }
@@ -397,11 +491,17 @@ private:
             std::shared_lock<std::shared_mutex> lock(state_mutex_);
             start_q = current_q_;
         }
-
-        pinocchio::forwardKinematics(pin_model_, pin_data_, start_q);
-        pinocchio::updateFramePlacements(pin_model_, pin_data_);
         
-        Eigen::Vector3d p1 = pin_data_.oMf[eef_frame_id_].translation();
+        // Target check
+        if (pose_to_matrix(goal->pose_target)(2,3) < Z_MIN_THRESHOLD || pose_to_matrix(goal->pose_aux)(2,3) < Z_MIN_THRESHOLD) {
+            throw std::runtime_error("GROUND_COLLISION: Target or Aux pose hits the safety floor.");
+        }
+
+        pinocchio::Data local_data(pin_model_);
+        pinocchio::forwardKinematics(pin_model_, local_data, start_q);
+        pinocchio::updateFramePlacements(pin_model_, local_data);
+        
+        Eigen::Vector3d p1 = local_data.oMf[eef_frame_id_].translation();
         Eigen::Vector3d p2 = pose_to_matrix(goal->pose_aux).block<3,1>(0,3);
         Eigen::Vector3d p3 = pose_to_matrix(goal->pose_target).block<3,1>(0,3);
 
@@ -460,7 +560,7 @@ private:
             Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
             Eigen::VectorXd prev_dq = Eigen::VectorXd::Zero(6);
 
-            Eigen::Quaterniond q_start(pin_data_.oMf[eef_frame_id_].rotation());
+            Eigen::Quaterniond q_start(local_data.oMf[eef_frame_id_].rotation());
             Eigen::Quaterniond q_end(pose_to_matrix(goal->pose_target).block<3,3>(0,0));
             Eigen::AngleAxisd aa(q_start.inverse() * q_end);
 
@@ -475,28 +575,30 @@ private:
                     // 1. Interpolation
                     Eigen::Vector3d p_t = center + radius * std::cos(current_theta) * X_dir + radius * std::sin(current_theta) * Y_dir;
                     
-                    // Z-Axis Anti-Collision
-                    if (p_t.z() < Z_MIN_THRESHOLD) throw std::runtime_error("Z-Limit Violation! Path hits the floor.");
-
                     Eigen::Matrix4d T_t = Eigen::Matrix4d::Identity();
                     T_t.block<3,3>(0,0) = q_start.slerp(s, q_end).toRotationMatrix();
                     T_t.block<3,1>(0,3) = p_t;
 
                     // 2. Inverse kinematics
-                    std::array<double, 6> q_ik;
-                    if (!kin_engine_.solve_optimal_ik(T_t, q_ref, q_ik, true)) {
-                        throw std::runtime_error("Singularity or Quadrant Jump detected during MOVEC.");
+                    std::vector<std::array<double, 6>> valid_sols;
+                    if (!kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true)) {
+                        throw std::runtime_error("Singularity, No IK, or Quadrant Jump detected during MOVEC.");
                     }
-                    q_ref = q_ik;
+                    q_ref = valid_sols[0];
+
+                    // --- Dynamic strict ground checking for aLL links ---
+                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
+                    if (get_min_z_height(q_eig) < Z_MIN_THRESHOLD) {
+                        throw std::runtime_error("GROUND_COLLISION: Interpolated circle path hits the floor.");
+                    }
 
                     // 3. Jacobian inverse mapping for velocity
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ik.data(), 6);
                     double dtheta_dt = ds * total_angle;
                     Eigen::Vector3d v_world = dtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir);
                     Eigen::Vector3d w_world = ds * aa.angle() * (q_start * aa.axis());
 
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(pin_model_, pin_data_, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(pin_model_, local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
                     Eigen::VectorXd V_spatial(6); V_spatial << v_world, w_world;
                     
@@ -510,7 +612,7 @@ private:
 
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
-                        pt.positions.push_back(q_ik[i]);
+                        pt.positions.push_back(q_ref[i]);
                         pt.velocities.push_back(dq(i));
                         pt.accelerations.push_back(ddq(i));
                     }
