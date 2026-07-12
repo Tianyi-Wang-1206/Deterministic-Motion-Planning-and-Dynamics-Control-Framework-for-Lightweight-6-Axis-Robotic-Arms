@@ -5,53 +5,52 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Find basic ROS 2 dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
-find_package(lite6_interfaces REQUIRED)
 find_package(ament_index_cpp REQUIRED)
-
-# 寻找外部工业级依赖库
-find_package(pinocchio REQUIRED)
-find_package(ruckig REQUIRED)
 find_package(yaml-cpp REQUIRED)
-# 新增：寻找 Eigen3
-find_package(Eigen3 REQUIRED)
 
-# 1. 编译运动学核心库
+# Find our custom interfaces
+find_package(lite6_interfaces REQUIRED)
+
+# Find Ruckig for trajectory generation
+find_package(ruckig REQUIRED)
+
+# Find Pinocchio and HPP-FCL for Kinematics and Collision Checking
+find_package(pinocchio REQUIRED)
+find_package(coal REQUIRED)
+
 add_library(kinematics_engine SHARED src/kinematics_engine.cpp)
 target_include_directories(kinematics_engine PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-# 新增：链接 Eigen3::Eigen
-target_link_libraries(kinematics_engine PUBLIC yaml-cpp Eigen3::Eigen)
+ament_target_dependencies(kinematics_engine 
+  rclcpp 
+  ament_index_cpp
+)
+# Link Pinocchio and HPP-FCL to the engine
+target_link_libraries(kinematics_engine pinocchio::pinocchio coal::coal yaml-cpp)
 
-# 2. 编译主规划器节点
 add_executable(lite6_planner_node src/lite6_planner_node.cpp)
 target_include_directories(lite6_planner_node PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
 ament_target_dependencies(lite6_planner_node
   rclcpp
   rclcpp_action
   sensor_msgs
   trajectory_msgs
   control_msgs
-  lite6_interfaces
   ament_index_cpp
+  lite6_interfaces
 )
-
-# 链接所有的数学和动力学库
-# 新增：链接 Eigen3::Eigen
-target_link_libraries(lite6_planner_node 
-  kinematics_engine
-  pinocchio::pinocchio
-  ruckig::ruckig
-  Eigen3::Eigen
-)
+# Link Ruckig and our custom kinematics engine
+target_link_libraries(lite6_planner_node ruckig::ruckig kinematics_engine)
 
 install(TARGETS kinematics_engine lite6_planner_node
   ARCHIVE DESTINATION lib
@@ -64,6 +63,6 @@ install(DIRECTORY config/ DESTINATION share/${PROJECT_NAME}/config)
 
 ament_export_include_directories(include)
 ament_export_libraries(kinematics_engine)
-ament_export_dependencies(rclcpp lite6_interfaces pinocchio ruckig)
+ament_export_dependencies(rclcpp rclcpp_action sensor_msgs trajectory_msgs control_msgs ament_index_cpp lite6_interfaces pinocchio coal yaml-cpp ruckig)
 
 ament_package()
