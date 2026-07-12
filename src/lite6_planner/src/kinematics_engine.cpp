@@ -2,6 +2,7 @@
 #include <yaml-cpp/yaml.h>
 #include <cmath>
 #include <limits>
+#include <algorithm>
 #include <iostream>
 
 namespace lite6_planner
@@ -209,15 +210,13 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
 
 bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T, 
                                         const std::array<double, 6>& q_ref, 
-                                        std::array<double, 6>& q_out,
+                                        std::vector<std::array<double, 6>>& valid_solutions_sorted,
                                         bool is_continuous_path)
 {
     double cg0[8][6];
     raw_inverse_kinematics(T, cg0); // Derive 8 possible IK solutions
 
-    double min_dist = std::numeric_limits<double>::max();
-    int best_idx = -1;
-    std::array<double, 6> best_q;
+    std::vector<IKSolution> candidate_solutions;
 
     for (int i = 0; i < 8; ++i) {
         std::array<double, 6> current_sol;
@@ -231,7 +230,7 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
             double best_q_j = q_base;
             double min_j_dist = std::numeric_limits<double>::max();
             
-            // Scan through multiple revolutions
+            // Scan through multiple revolutions (handling wrap-around)
             for (int k = -2; k <= 2; ++k) {
                 double test_q = q_base + k * 2.0 * M_PI;
                 // Ensure the test joint angle is within the joint limits
@@ -244,48 +243,51 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
                 }
             }
 
-            // Abort if no valid joint angle was found within limits
+            // Abort this specific IK group if no valid joint angle was found within physical limits
             if (min_j_dist == std::numeric_limits<double>::max()) {
                 limits_violated = true;
                 break;
             }
 
-            // Abort if a quadrant jump is detected in MoveL or MoveC mode
+            // MoveL/MoveC Safety: Abort if a quadrant jump (wrist flip) is detected
             if (is_continuous_path && min_j_dist > quadrant_jump_threshold_) {
                 quadrant_jumped = true;
                 break;
             }
 
             current_sol[j] = best_q_j;
-            // Weighted Euclidean distance (base and forearm have higher movement costs)
+            
+            // Weighted Euclidean distance (base and forearm have higher mechanical movement costs)
             double weights[6] = {1.5, 1.5, 1.2, 1.0, 1.0, 0.8};
             dist += weights[j] * min_j_dist * min_j_dist;
         }
 
         if (limits_violated || quadrant_jumped) continue;
 
-        // Update the overall best solution
-        if (dist < min_dist) {
-            min_dist = dist;
-            best_idx = i;
-            best_q = current_sol;
+        // --- Add valid solution to the priority pool ---
+        IKSolution valid_sol;
+        valid_sol.q = current_sol;
+        valid_sol.cost_distance = dist;
+        candidate_solutions.push_back(valid_sol);
+    }
+
+    if (candidate_solutions.empty()) {
+        return false; // ERR_NO_IK_SOLUTION
+    }
+
+    // Sort solutions based on minimum movement effort (cost_distance)
+    std::sort(candidate_solutions.begin(), candidate_solutions.end());
+
+    // Final filter: Reject solutions strictly inside a singularity zone (if in continuous mode)
+    valid_solutions_sorted.clear();
+    for (const auto& sol : candidate_solutions) {
+        if (is_continuous_path && std::abs(check_singularity(sol.q)) < singularity_threshold_) {
+            continue; // Skip singular solutions for linear/circular interpolations
         }
+        valid_solutions_sorted.push_back(sol.q);
     }
 
-    if (best_idx == -1) {
-        return false; 
-    }
-
-    q_out = best_q;
-
-    // Check for singularity if in continuous path mode (MoveL/MoveC)
-    if (is_continuous_path) {
-        if (std::abs(check_singularity(q_out)) < singularity_threshold_) {
-            return false;
-        }
-    }
-
-    return true;
+    return !valid_solutions_sorted.empty();
 }
 
 } // namespace lite6_planner

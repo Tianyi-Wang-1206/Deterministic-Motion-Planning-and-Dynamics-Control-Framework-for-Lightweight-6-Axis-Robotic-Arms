@@ -23,6 +23,17 @@ struct CartesianLimit {
     double max_rot_acc;
 };
 
+// --- Structure to hold evaluated IK solutions for sorting ---
+struct IKSolution {
+    std::array<double, 6> q;
+    double cost_distance; // Weighted joint distance from current pose
+    
+    // Sort ascending by cost (smaller distance is better)
+    bool operator<(const IKSolution& other) const { 
+        return cost_distance < other.cost_distance; 
+    }
+};
+
 class KinematicsEngine
 {
 public:
@@ -31,11 +42,11 @@ public:
     // Load the physical limits of the robot from YAML
     bool load_limits(const std::string& yaml_path);
     
-    // Core functionality: Given the homogeneous transformation matrix T and the current reference joint angles, find the optimal and valid IK solution
-    // is_continuous_path = true when (e.g., MoveL/MoveC), strictly prohibit quadrant jumps
+    // --- Returns a sorted list of all VALID IK solutions ---
+    // is_continuous_path = true (e.g., MoveL/MoveC), strictly prohibit quadrant jumps
     bool solve_optimal_ik(const Eigen::Matrix4d& T, 
                           const std::array<double, 6>& q_ref, 
-                          std::array<double, 6>& q_out,
+                          std::vector<std::array<double, 6>>& valid_solutions_sorted,
                           bool is_continuous_path);
 
     // Calculate the singularity measure based on the Jacobian determinant (Maple generated)
