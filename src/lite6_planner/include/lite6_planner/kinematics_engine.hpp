@@ -6,6 +6,11 @@
 #include <string>
 #include <Eigen/Dense>
 
+// Pinocchio core & geometry headers
+#include <pinocchio/multibody/model.hpp>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/geometry.hpp>
+
 namespace lite6_planner
 {
 
@@ -42,6 +47,11 @@ public:
     // Load the physical limits of the robot from YAML
     bool load_limits(const std::string& yaml_path);
     
+    // --- Initialize the Kinematic and Collision Geometry Models ---
+    // This loads the URDF, the STL collision meshes, and prunes the collision
+    // tree using the allowed collision matrix from the SRDF.
+    bool init_robot_model(const std::string& urdf_path, const std::string& srdf_path);
+
     // --- Returns a sorted list of all VALID IK solutions ---
     // is_continuous_path = true (e.g., MoveL/MoveC), strictly prohibit quadrant jumps
     bool solve_optimal_ik(const Eigen::Matrix4d& T, 
@@ -51,6 +61,13 @@ public:
 
     // Calculate the singularity measure based on the Jacobian determinant (Maple generated)
     double check_singularity(const std::array<double, 6>& q) const;
+
+    // --- Perform a full 3D collision check (Self + Ground) ---
+    // Returns true if a collision is detected at configuration q
+    bool check_collision(const std::array<double, 6>& q) const;
+
+    // --- Get Pinocchio model reference for external Jacobian/FK usage ---
+    const pinocchio::Model& get_pin_model() const { return pin_model_; }
 
     const std::array<JointLimit, 6>& get_joint_limits() const { return joint_limits_; }
     const CartesianLimit& get_cartesian_limits() const { return cart_limits_; }
@@ -64,6 +81,10 @@ private:
     CartesianLimit cart_limits_;
     double singularity_threshold_;
     double quadrant_jump_threshold_;
+
+    // --- Pinocchio Engine Components ---
+    pinocchio::Model pin_model_;
+    pinocchio::GeometryModel geom_model_;
 };
 
 } // namespace lite6_planner

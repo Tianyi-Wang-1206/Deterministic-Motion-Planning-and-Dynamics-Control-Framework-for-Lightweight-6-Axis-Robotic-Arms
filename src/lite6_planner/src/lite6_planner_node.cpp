@@ -6,16 +6,16 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <shared_mutex>
 #include <string>
+#include <array>
 
 // Include the action definition and kinematics engine header
 #include "lite6_interfaces/action/industrial_motion.hpp"
 #include "lite6_planner/kinematics_engine.hpp"
 
-// Ruckig & Pinocchio
+// Ruckig & Pinocchio (No Coal/HPP-FCL headers needed here, fully encapsulated in the engine!)
 #include <ruckig/ruckig.hpp>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
-#include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
@@ -38,25 +38,27 @@ public:
 
     IndustrialPlannerNode() : Node("lite6_industrial_planner")
     {
-        // 1. Initialize Pinocchio and kinematics engine
+        // 1. Initialize Kinematics Engine (Now includes URDF, SRDF and Collision geometry)
         std::string pkg_path = ament_index_cpp::get_package_share_directory("lite6_description");
-        std::string urdf_path = pkg_path + "/urdf/lite6.urdf";
-        std::string limits_path = ament_index_cpp::get_package_share_directory("lite6_planner") + "/config/kinematic_limits.yaml";
-
-        pinocchio::urdf::buildModel(urdf_path, pin_model_);
-        eef_frame_id_ = pin_model_.getFrameId("link_eef");
+        std::string planner_pkg_path = ament_index_cpp::get_package_share_directory("lite6_planner");
         
-        // --- Register critical frames for global ground collision checks ---
-        critical_frames_.push_back(pin_model_.getFrameId("link3"));
-        critical_frames_.push_back(pin_model_.getFrameId("link4"));
-        critical_frames_.push_back(pin_model_.getFrameId("link5"));
-        critical_frames_.push_back(pin_model_.getFrameId("link6"));
-        critical_frames_.push_back(eef_frame_id_);
+        std::string urdf_path = pkg_path + "/urdf/lite6.urdf";
+        std::string srdf_path = planner_pkg_path + "/config/lite6.srdf";
+        std::string limits_path = planner_pkg_path + "/config/kinematic_limits.yaml";
+
+        // --- Initialize the dual-engine (Kinematics + Coal Geometry) ---
+        if (!kin_engine_.init_robot_model(urdf_path, srdf_path)) {
+            RCLCPP_FATAL(this->get_logger(), "Failed to initialize URDF/SRDF Geometry Model!");
+            throw std::runtime_error("Geometry init failed");
+        }
 
         if (!kin_engine_.load_limits(limits_path)) {
             RCLCPP_FATAL(this->get_logger(), "Failed to load kinematic limits!");
             throw std::runtime_error("Limits load failed");
         }
+
+        // Retrieve EEF frame ID from the engine's Pinocchio model
+        eef_frame_id_ = kin_engine_.get_pin_model().getFrameId("link_eef");
 
         current_q_ = Eigen::VectorXd::Zero(6);
         joint_names_ = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
@@ -82,13 +84,11 @@ public:
             std::bind(&IndustrialPlannerNode::handle_cancel, this, _1),
             std::bind(&IndustrialPlannerNode::handle_accepted, this, _1));
 
-        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY.");
+        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY (Coal Collision Enabled).");
     }
 
 private:
-    pinocchio::Model pin_model_;
     pinocchio::FrameIndex eef_frame_id_;
-    std::vector<pinocchio::FrameIndex> critical_frames_;
     KinematicsEngine kin_engine_;
 
     Eigen::VectorXd current_q_;
@@ -97,42 +97,27 @@ private:
     // Mutex to prevent data race between ROS spin thread and Execution thread
     std::shared_mutex state_mutex_; 
 
-    // Z-axis minimum threshold to prevent colliding with the table (5cm)
-    const double Z_MIN_THRESHOLD = 0.05; 
-
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr js_sub_;
     rclcpp_action::Client<FJT>::SharedPtr jtc_client_;
     rclcpp_action::Server<IndustrialMotion>::SharedPtr action_server_;
 
-    // --- Ground Collision Helper Methods ---
-    
-    // Retrieves the minimum Z-height among all critical joints for a given configuration
-    double get_min_z_height(const Eigen::VectorXd& q) {
-        // Thread-safe local Pinocchio Data instance
-        pinocchio::Data local_data(pin_model_);
-        pinocchio::forwardKinematics(pin_model_, local_data, q);
-        pinocchio::updateFramePlacements(pin_model_, local_data);
-        
-        double min_z = std::numeric_limits<double>::max();
-        for (auto frame_id : critical_frames_) {
-            double z = local_data.oMf[frame_id].translation().z();
-            if (z < min_z) min_z = z;
-        }
-        return min_z;
-    }
-
-    // Checks an entire generated trajectory for mid-air "elbow drops" (sub-sampled for performance)
-    bool is_trajectory_safe_from_ground(const trajectory_msgs::msg::JointTrajectory& traj) {
+    // --- Universal Mid-air Collision Checker using Coal ---
+    // Checks an entire generated trajectory for mid-air collisions (sub-sampled for performance)
+    bool is_trajectory_collision_free(const trajectory_msgs::msg::JointTrajectory& traj) {
         if (traj.points.empty()) return true;
         
-        // Sub-sample: Check every 10th point to save CPU
+        // Sub-sample: Check every 10th point to save CPU (e.g., check every 0.1s if dt=0.01s)
         for (size_t i = 0; i < traj.points.size(); i += 10) {
-            Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(traj.points[i].positions.data(), 6);
-            if (get_min_z_height(q) < Z_MIN_THRESHOLD) return false;
+            std::array<double, 6> q;
+            for(int j=0; j<6; ++j) q[j] = traj.points[i].positions[j];
+            
+            if (kin_engine_.check_collision(q)) return false;
         }
-        // Always check the exact final point
-        Eigen::VectorXd q_end = Eigen::Map<const Eigen::VectorXd>(traj.points.back().positions.data(), 6);
-        if (get_min_z_height(q_end) < Z_MIN_THRESHOLD) return false;
+        
+        // Always strictly check the exact final point
+        std::array<double, 6> q_end;
+        for(int j=0; j<6; ++j) q_end[j] = traj.points.back().positions[j];
+        if (kin_engine_.check_collision(q_end)) return false;
         
         return true;
     }
@@ -174,7 +159,7 @@ private:
             std::string err_msg = e.what();
             
             // --- Strict error categorization mapping ---
-            if (err_msg.find("GROUND_COLLISION") != std::string::npos) {
+            if (err_msg.find("COLLISION") != std::string::npos) {
                 result->error_code = IndustrialMotion::Result::ERR_LIMIT_VIOLATION;
             } else if (err_msg.find("NO_IK") != std::string::npos) {
                 result->error_code = IndustrialMotion::Result::ERR_NO_IK_SOLUTION;
@@ -207,18 +192,20 @@ private:
         if (goal->command_type == IndustrialMotion::Goal::MOVEJ) {
             // MOVEJ Logic
             Eigen::VectorXd target_q_eig = Eigen::Map<const Eigen::VectorXd>(goal->joint_target.data(), 6);
+            std::array<double, 6> target_q_arr;
+            for(int i=0; i<6; ++i) target_q_arr[i] = target_q_eig[i];
             
-            // Target check: Ensure target joint config doesn't smash the floor
-            if (get_min_z_height(target_q_eig) < Z_MIN_THRESHOLD) {
-                throw std::runtime_error("GROUND_COLLISION: Target joint configuration hits the ground!");
+            // --- Target check using Coal ---
+            if (kin_engine_.check_collision(target_q_arr)) {
+                throw std::runtime_error("COLLISION: Target joint configuration results in physical collision!");
             }
             
             // Generate Ruckig traj
             auto traj = generate_ruckig_traj(start_q, target_q_eig, goal->velocity_scale, goal->acceleration_scale);
             
-            // Mid-trajectory check
-            if (!is_trajectory_safe_from_ground(traj)) {
-                throw std::runtime_error("GROUND_COLLISION: Mid-trajectory hits the ground during MoveJ execution!");
+            // --- Mid-trajectory check using Coal ---
+            if (!is_trajectory_collision_free(traj)) {
+                throw std::runtime_error("COLLISION: Mid-trajectory collision detected during MoveJ execution!");
             }
             return traj;
         } 
@@ -226,14 +213,10 @@ private:
             // MOVEP Logic
             Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
             
-            // Target check: Z-Axis limit check for PTP target
-            if (T_goal(2,3) < Z_MIN_THRESHOLD) {
-                throw std::runtime_error("GROUND_COLLISION: Target pose hits the safety floor.");
-            }
-
-            pinocchio::Data local_data(pin_model_);
-            pinocchio::forwardKinematics(pin_model_, local_data, start_q);
-            pinocchio::updateFramePlacements(pin_model_, local_data);
+            // Local pinocchio calculation using the engine's model
+            pinocchio::Data local_data(kin_engine_.get_pin_model());
+            pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
+            pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
             
             Eigen::Matrix4d T_current = Eigen::Matrix4d::Identity();
             T_current.block<3,3>(0,0) = local_data.oMf[eef_frame_id_].rotation();
@@ -253,25 +236,25 @@ private:
             
             std::vector<std::array<double, 6>> valid_ik_solutions;
             if (!kin_engine_.solve_optimal_ik(T_goal, q_ref, valid_ik_solutions, false)) {
-                throw std::runtime_error("NO_IK_SOLUTION: Target is physically unreachable or outside limits.");
+                throw std::runtime_error("NO_IK_SOLUTION: Target is physically unreachable, outside limits, or in COLLISION.");
             }
 
-            // --- Multi-solution iteration to avoid "Elbow Drops" ---
+            // --- Multi-solution iteration to avoid mid-air collisions ---
             for (const auto& q_target_candidate : valid_ik_solutions) {
                 Eigen::VectorXd target_q_eig = Eigen::Map<const Eigen::VectorXd>(q_target_candidate.data(), 6);
                 
-                // Target is known to be IK-valid, generate its interpolation trajectory
+                // Target is known to be IK-valid and collision-free, generate its interpolation trajectory
                 auto traj = generate_ruckig_traj(start_q, target_q_eig, goal->velocity_scale, goal->acceleration_scale);
                 
-                // If it doesn't hit the ground mid-air, it's our golden ticket!
-                if (is_trajectory_safe_from_ground(traj)) {
+                // If the dynamic path doesn't hit anything, it's our golden ticket!
+                if (is_trajectory_collision_free(traj)) {
                     return traj;
                 }
                 
-                RCLCPP_WARN(this->get_logger(), "MoveP Priority IK Path hits ground. Rerouting to next sub-optimal IK solution...");
+                RCLCPP_WARN(this->get_logger(), "MoveP Priority IK Path implies mid-air collision. Rerouting to next sub-optimal IK solution...");
             }
             
-            throw std::runtime_error("GROUND_COLLISION: All possible IK routes result in an elbow drop or ground collision!");
+            throw std::runtime_error("COLLISION: All possible IK routes result in a mid-air collision!");
         }
     }
 
@@ -334,15 +317,12 @@ private:
             start_q = current_q_;
         }
         
-        // Quick target check
         Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
-        if (T_goal(2,3) < Z_MIN_THRESHOLD) {
-            throw std::runtime_error("GROUND_COLLISION: Target pose hits the safety floor.");
-        }
 
-        pinocchio::Data local_data(pin_model_);
-        pinocchio::forwardKinematics(pin_model_, local_data, start_q);
-        pinocchio::updateFramePlacements(pin_model_, local_data);
+        // --- Use Engine's model for Forward Kinematics ---
+        pinocchio::Data local_data(kin_engine_.get_pin_model());
+        pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
+        pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
         pinocchio::SE3 pose_start = local_data.oMf[eef_frame_id_];
         
         pinocchio::SE3 pose_end(T_goal.block<3,3>(0,0), T_goal.block<3,1>(0,3));
@@ -404,23 +384,19 @@ private:
 
                     // 2. Find IK solution for the interpolated pose
                     std::vector<std::array<double, 6>> valid_sols;
+                    // --- Solve_optimal_ik automatically checks for continuous Collision & Singularity ---
                     if (!kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true)) {
-                        throw std::runtime_error("Singularity, No IK, or Quadrant Jump detected during MOVEL.");
+                        throw std::runtime_error("COLLISION, Singularity, No IK, or Quadrant Jump detected during MOVEL.");
                     }
-                    q_ref = valid_sols[0]; // Take the best continuous solution
-
-                    // --- Dynamic strict ground checking for aLL links ---
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
-                    if (get_min_z_height(q_eig) < Z_MIN_THRESHOLD) {
-                        throw std::runtime_error("GROUND_COLLISION: Interpolated path forces a link to hit the floor.");
-                    }
+                    q_ref = valid_sols[0]; // Take the best continuous, collision-free solution
 
                     // 3. Derive joint velocities using Jacobian
+                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
                     Eigen::Vector3d v_world = ds * (pose_end.translation() - pose_start.translation());
                     Eigen::Vector3d w_world = ds * d_rot * (pose_start.rotation() * aa.axis());
                     
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(pin_model_, local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
                     Eigen::VectorXd V_spatial(6);
                     V_spatial << v_world, w_world;
@@ -446,7 +422,7 @@ private:
                     output.pass_to_input(input);
                 } while (res == ruckig::Result::Working);
             } catch (const std::exception& e) {
-                // If singularity or Z-limit breaks the generation, propagate error to abort
+                // If collision or singularity breaks the generation, propagate error to abort
                 throw; 
             }
 
@@ -492,14 +468,9 @@ private:
             start_q = current_q_;
         }
         
-        // Target check
-        if (pose_to_matrix(goal->pose_target)(2,3) < Z_MIN_THRESHOLD || pose_to_matrix(goal->pose_aux)(2,3) < Z_MIN_THRESHOLD) {
-            throw std::runtime_error("GROUND_COLLISION: Target or Aux pose hits the safety floor.");
-        }
-
-        pinocchio::Data local_data(pin_model_);
-        pinocchio::forwardKinematics(pin_model_, local_data, start_q);
-        pinocchio::updateFramePlacements(pin_model_, local_data);
+        pinocchio::Data local_data(kin_engine_.get_pin_model());
+        pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
+        pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
         
         Eigen::Vector3d p1 = local_data.oMf[eef_frame_id_].translation();
         Eigen::Vector3d p2 = pose_to_matrix(goal->pose_aux).block<3,1>(0,3);
@@ -581,24 +552,20 @@ private:
 
                     // 2. Inverse kinematics
                     std::vector<std::array<double, 6>> valid_sols;
+                    // --- Solve_optimal_ik automatically checks for continuous Collision & Singularity ---
                     if (!kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true)) {
-                        throw std::runtime_error("Singularity, No IK, or Quadrant Jump detected during MOVEC.");
+                        throw std::runtime_error("COLLISION, Singularity, No IK, or Quadrant Jump detected during MOVEC.");
                     }
                     q_ref = valid_sols[0];
 
-                    // --- Dynamic strict ground checking for aLL links ---
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
-                    if (get_min_z_height(q_eig) < Z_MIN_THRESHOLD) {
-                        throw std::runtime_error("GROUND_COLLISION: Interpolated circle path hits the floor.");
-                    }
-
                     // 3. Jacobian inverse mapping for velocity
+                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
                     double dtheta_dt = ds * total_angle;
                     Eigen::Vector3d v_world = dtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir);
                     Eigen::Vector3d w_world = ds * aa.angle() * (q_start * aa.axis());
 
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(pin_model_, local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
                     Eigen::VectorXd V_spatial(6); V_spatial << v_world, w_world;
                     

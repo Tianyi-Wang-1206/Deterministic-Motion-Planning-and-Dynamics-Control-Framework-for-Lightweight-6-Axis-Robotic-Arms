@@ -5,6 +5,19 @@
 #include <algorithm>
 #include <iostream>
 
+// ROS2 ament_index to find mesh paths for Pinocchio
+#include <ament_index_cpp/get_packages_with_prefixes.hpp>
+
+// Pinocchio parsers and collision algorithms
+#include <pinocchio/parsers/urdf.hpp>
+#include <pinocchio/parsers/srdf.hpp>
+#include <pinocchio/collision/collision.hpp>
+#include <pinocchio/algorithm/kinematics.hpp>
+#include <pinocchio/algorithm/geometry.hpp>
+
+// HPP-FCL shapes for programmatically adding the ground
+#include <coal/shape/geometric_shapes.h>
+
 namespace lite6_planner
 {
 
@@ -36,6 +49,80 @@ bool KinematicsEngine::load_limits(const std::string& yaml_path)
         std::cerr << "[KinematicsEngine] Failed to load limits YAML: " << e.what() << std::endl;
         return false;
     }
+}
+
+bool KinematicsEngine::init_robot_model(const std::string& urdf_path, const std::string& srdf_path)
+{
+    try {
+        // 1. Build Kinematic Model
+        pinocchio::urdf::buildModel(urdf_path, pin_model_);
+
+        // 2. Resolve ROS 2 Package Paths for Mesh Loading
+        // Pinocchio needs to know where "package://lite6_description/..." points to.
+        std::vector<std::string> package_dirs;
+        auto packages = ament_index_cpp::get_packages_with_prefixes();
+        for (const auto& pkg : packages) {
+            package_dirs.push_back(pkg.second + "/share");
+        }
+
+        // 3. Build Geometry Model from URDF (Collision meshes)
+        pinocchio::urdf::buildGeom(pin_model_, urdf_path, pinocchio::COLLISION, geom_model_, package_dirs);
+
+        // 4. Add all possible collision pairs, then prune them using SRDF
+        geom_model_.addAllCollisionPairs();
+        pinocchio::srdf::removeCollisionPairs(pin_model_, geom_model_, srdf_path);
+
+        // 5. Programmatically build a safe ground floor using COAL (formerly HPP-FCL) Box
+        // Size: 3m x 3m x 0.1m, positioned at Z = -0.05m
+        auto ground_shape = std::make_shared<coal::Box>(3.0, 3.0, 0.1);
+        pinocchio::SE3 ground_placement(Eigen::Matrix3d::Identity(), Eigen::Vector3d(0.0, 0.0, -0.05));
+        
+        // Find the root frame (usually universe or link_base) to attach the ground
+        pinocchio::FrameIndex base_frame_id = pin_model_.getFrameId("link_base");
+        pinocchio::JointIndex base_joint_id = pin_model_.frames[base_frame_id].parentJoint;
+
+        // NEW API in Pinocchio 3.x (ROS 2 Jazzy):
+        // GeometryObject(name, parent_joint, parent_frame, placement, collision_geometry)
+        pinocchio::GeometryObject ground_obj(
+            "ground_plane", 
+            base_joint_id, 
+            base_frame_id, 
+            ground_placement, 
+            ground_shape
+        );
+        geom_model_.addGeometryObject(ground_obj);
+
+        // Add collision pairs between the newly added ground and all other robot links
+        size_t ground_id = geom_model_.geometryObjects.size() - 1;
+        for(size_t i = 0; i < ground_id; ++i) {
+            geom_model_.addCollisionPair(pinocchio::CollisionPair(i, ground_id));
+        }
+
+        std::cout << "[KinematicsEngine] Pinocchio + HPP-FCL Geometry initialized with SRDF pruning and Ground!" << std::endl;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[KinematicsEngine] Fatal error during geometry init: " << e.what() << std::endl;
+        return false;
+    }
+}
+
+bool KinematicsEngine::check_collision(const std::array<double, 6>& q) const
+{
+    // Map std::array to Eigen Vector
+    Eigen::VectorXd q_eig = Eigen::Map<const Eigen::VectorXd>(q.data(), 6);
+
+    // Thread-safe local data structures for Pinocchio calculations
+    pinocchio::Data local_data(pin_model_);
+    pinocchio::GeometryData local_geom_data(geom_model_);
+
+    // Compute forward kinematics for all joints and frames
+    pinocchio::forwardKinematics(pin_model_, local_data, q_eig);
+    pinocchio::updateGeometryPlacements(pin_model_, local_data, geom_model_, local_geom_data);
+
+    // Perform Fast-Exit collision checking (stops at the first collision detected)
+    bool is_colliding = pinocchio::computeCollisions(geom_model_, local_geom_data, true);
+    
+    return is_colliding;
 }
 
 double KinematicsEngine::check_singularity(const std::array<double, 6>& q) const
@@ -214,7 +301,7 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
                                         bool is_continuous_path)
 {
     double cg0[8][6];
-    raw_inverse_kinematics(T, cg0); // Derive 8 possible IK solutions
+    raw_inverse_kinematics(T, cg0);
 
     std::vector<IKSolution> candidate_solutions;
 
@@ -224,16 +311,14 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
         double dist = 0.0;
         bool quadrant_jumped = false;
 
-        // Find the closest valid joint angles to the reference for each joint
+        // 1. Find the closest valid joint angles (handling -2pi to 2pi wrap-around)
         for (int j = 0; j < 6; ++j) {
             double q_base = cg0[i][j];
             double best_q_j = q_base;
             double min_j_dist = std::numeric_limits<double>::max();
             
-            // Scan through multiple revolutions (handling wrap-around)
             for (int k = -2; k <= 2; ++k) {
                 double test_q = q_base + k * 2.0 * M_PI;
-                // Ensure the test joint angle is within the joint limits
                 if (test_q >= joint_limits_[j].min_pos - 1e-4 && test_q <= joint_limits_[j].max_pos + 1e-4) {
                     double d = std::abs(test_q - q_ref[j]);
                     if (d < min_j_dist) {
@@ -243,13 +328,11 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
                 }
             }
 
-            // Abort this specific IK group if no valid joint angle was found within physical limits
             if (min_j_dist == std::numeric_limits<double>::max()) {
                 limits_violated = true;
                 break;
             }
 
-            // MoveL/MoveC Safety: Abort if a quadrant jump (wrist flip) is detected
             if (is_continuous_path && min_j_dist > quadrant_jump_threshold_) {
                 quadrant_jumped = true;
                 break;
@@ -257,14 +340,17 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
 
             current_sol[j] = best_q_j;
             
-            // Weighted Euclidean distance (base and forearm have higher mechanical movement costs)
             double weights[6] = {1.5, 1.5, 1.2, 1.0, 1.0, 0.8};
             dist += weights[j] * min_j_dist * min_j_dist;
         }
 
         if (limits_violated || quadrant_jumped) continue;
 
-        // --- Add valid solution to the priority pool ---
+        // --- Hardware limit valid, now perform rigid HPP-FCL collision check ---
+        if (check_collision(current_sol)) {
+            continue; // Reject this IK solution due to self-collision or ground collision
+        }
+
         IKSolution valid_sol;
         valid_sol.q = current_sol;
         valid_sol.cost_distance = dist;
@@ -272,17 +358,17 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
     }
 
     if (candidate_solutions.empty()) {
-        return false; // ERR_NO_IK_SOLUTION
+        return false; // ERR_NO_IK_SOLUTION or ERR_COLLISION
     }
 
-    // Sort solutions based on minimum movement effort (cost_distance)
+    // 2. Sort solutions based on minimum movement effort
     std::sort(candidate_solutions.begin(), candidate_solutions.end());
 
-    // Final filter: Reject solutions strictly inside a singularity zone (if in continuous mode)
+    // 3. Final filter: Reject solutions inside a singularity zone (if in continuous mode)
     valid_solutions_sorted.clear();
     for (const auto& sol : candidate_solutions) {
         if (is_continuous_path && std::abs(check_singularity(sol.q)) < singularity_threshold_) {
-            continue; // Skip singular solutions for linear/circular interpolations
+            continue;
         }
         valid_solutions_sorted.push_back(sol.q);
     }
