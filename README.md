@@ -1,22 +1,26 @@
-# ROS 2 Dynamics Controller for Lightweight 6-Axis Robotic Arms
+# Deterministic Motion Planning and Dynamics Control Framework for Lightweight 6-Axis Robotic Arms
 
-![ROS 2 Humble](https://img.shields.io/badge/ROS_2-Humble-3498db.svg)
+![ROS 2 Jazzy](https://img.shields.io/badge/ROS_2-Jazzy-3498db.svg)
 ![C++17](https://img.shields.io/badge/C++-17-blue.svg)
-![Python 3.10](https://img.shields.io/badge/Python-3.10-yellow.svg)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-yellow.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-This repository presents a high-fidelity, mathematically rigorous 6-axis robotic arm simulation. Initiated by an asynchronous and detailed GUI (based on PyQt5), the system orchestrates high-level motion using **MoveIt2**, leveraging **TRAC-IK** for robust numerical solutions to inverse kinematics and the **Pilz** trajectory planning engine for deterministic Cartesian paths (LIN/CIRC). At the core, **Controller Chaining** (based on **ros2_control**) interpolates these trajectories into a tight 1000Hz reference for a custom **Computed Torque Control (CTC)** controller. To ensure physical realism, the CTC bypasses **MuJoCo**’s default PID joints to run the physics engine in pure **effort mode**. The CTC processes the feedback states via a **Kalman Filter** state observation model to reconstruct noise-free joint velocities, and executes **Pinocchio** dynamics calculations to compute rigid-body inertia, gravity, and Coriolis matrices. Combined with **friction/armature compensation** (smoothly neutralizing viscous damping, Coulomb stiction, and motor rotor inertia), this architecture achieves a tracking precision of $<0.01\text{ mm}$.
+This repository presents a high-fidelity, mathematically rigorous 6-axis robotic arm simulation and control framework. Initiated by an asynchronous and detailed GUI (based on PyQt5), the system orchestrates high-level motion using a **custom-built, deterministic C++ planning engine**, bypassing standard frameworks like MoveIt2. This planner leverages a **closed-form Analytical Inverse Kinematics** solver (derived via Maple symbolic computation), combined with **Coal (formerly HPP-FCL)** for 3D collision avoidance and symbolic Jacobian determinant analysis for singularity detection. Trajectory generation is handled by **Ruckig**, providing time-optimal profiles for Joint Space (**MoveJ**), Cartesion Space (**MoveP**), Linear (**MoveL**), and Circular (**MoveC**) Cartesian motions.
 
-To bridge the gap between nominal simulation parameters and real-world physical discrepancies, an automated **system identification** (SysID) framework is integrated to extract joint-level viscous/Coulomb friction and motor armature coefficients, which are difficult to measure directly during manufacturing. Utilizing a bounded **Fourier excitation trajectory** coupled with an offline **Least-Squares solver**, the identified parameters align closely with the ground-truth physical properties defined in the URDF and MuJoCo XML files. Furthermore, the architecture incorporates a robust software emergency stop (E-Stop) and active recovery state machine. Upon triggering, it overrides high-level commands to execute precise, limit-aware deceleration trajectories that safely halt the manipulator, while providing a seamless recovery sequence back to the active closed-loop tracking state.
+At the core, **Controller Chaining** (based on **ros2_control**) interpolates these trajectories into a tight 1000Hz reference for a custom **Computed Torque Control (CTC)** downstream controller. To ensure physical realism, the CTC bypasses **MuJoCo**’s default PID joints to run the physics engine in pure **effort mode**. The CTC processes the feedback states via a **1D Kalman Filter** state observation model to reconstruct noise-free joint velocities, and executes **Pinocchio** dynamics calculations to compute rigid-body inertia, gravity, and Coriolis matrices. Combined with **friction/armature compensation** (smoothly neutralizing viscous damping, Coulomb stiction, and motor rotor inertia), this architecture achieves a tracking precision of $<0.01\text{ mm}$.
 
-To facilitate real-time diagnostics and visual verification of tracking performance, the framework incorporates a synchronized **"shadow robot"** virtual twin. This visualization layer is driven directly by the real-time C++ CTC controller via a lock-free `RealtimePublisher`. It renders the exact internal target commands (`q_target_`) at 1000Hz (downsampled to 200Hz for RViz), representing the manipulator's theoretical kinematic state under zero-disturbance conditions. The shadow robot depicts pure kinematic targets, while the closed-loop CTC controller forces the physical manipulator to overcome physical disturbances (gravity, Coriolis, joint friction, etc.) to track this reference. Under standard operating conditions (including software E-Stop), the physical robot tracks the shadow twin tightly (deviation is indistinguishable to the human eye). However, there will be significant visible tracking deviation during **System Identification** because the friction and motor armature compensations are temporarily deactivated, allowing the algorithm to isolate and extract these specific raw unmodeled dynamics.
+To bridge the gap between nominal simulation parameters and real-world physical discrepancies, an automated **system identification** (SysID) framework is integrated to extract joint-level viscous/Coulomb friction and motor armature coefficients, which are difficult to measure directly during manufacturing. Utilizing a bounded **Fourier excitation trajectory** coupled with an offline **Least-Squares solver**, the identified parameters align closely with the ground-truth physical properties defined in the URDF and MuJoCo XML files. Furthermore, the architecture incorporates a robust software emergency stop (E-Stop) and active recovery state machine. Upon triggering, it overrides high-level commands to execute precise, kinematic-limit-aware deceleration trajectories that safely halt the manipulator, while providing a seamless recovery sequence back to the active closed-loop tracking state.
 
-For detailed mathematical derivations, please refer to [Theory.pdf](Theory.pdf).
+To facilitate real-time diagnostics and visual verification of tracking performance, the framework incorporates a synchronized **"shadow robot"** virtual twin. This visualization layer is driven directly by the real-time C++ CTC controller via a lock-free `RealtimePublisher`. It renders the exact internal target commands (`q_target_`) at 1000Hz (downsampled to 200Hz for RViz), representing the manipulator's theoretical kinematic state under zero-disturbance conditions. The shadow robot depicts pure kinematic targets, while the closed-loop CTC controller forces the physical manipulator to overcome physical disturbances (gravity, Coriolis, joint friction, etc.) to track this reference.
+
+For detailed mathematical derivations of the analytical IK and Jacobian matrices, please refer to [Kinematics.pdf](Kinematics.pdf).
+
+For detailed mathematical derivations of the CTC controller and the SysID process, please refer to [Theory.pdf](Theory.pdf).
 
 > ⚠️ **Notice:** The robot model used in this simulation is the **UFactory Lite6**, sourced from the official [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie). This repository is an independent open-source project designed for research and educational purposes.
 
 <p align="center">
-  <img src="media/demo_PTP.gif" width="1080" alt="PTP Motion and GUI Overview"/>
+  <img src="media/demo_MoveJ.gif" width="1080" alt="Joint PTP Motion and GUI Overview"/>
 </p>
 
 
@@ -27,6 +31,7 @@ For detailed mathematical derivations, please refer to [Theory.pdf](Theory.pdf).
 4. [Future Work](#-future-work)
 5. [Acknowledgements](#-acknowledgements)
 6. [Disclaimer](#-disclaimer)
+7. [Contact](#-contact)
 
 
 ## 🧠 System Architecture
@@ -36,14 +41,14 @@ The system's architecture is illustrated in the diagram below:
 graph TB
     %% Style Definitions
     classDef PyQt fill:#34495e,stroke:#2c3e50,stroke-width:2px,color:#fff;
-    classDef MoveIt fill:#2980b9,stroke:#1f3a52,stroke-width:2px,color:#fff;
+    classDef Planner fill:#c0392b,stroke:#922b21,stroke-width:2px,color:#fff;
     classDef R2C fill:#8e44ad,stroke:#5b2c6f,stroke-width:2px,color:#fff;
     classDef Custom fill:#d35400,stroke:#a04000,stroke-width:2px,color:#fff;
     classDef Physics fill:#27ae60,stroke:#1e8449,stroke-width:2px,color:#fff;
     classDef Util fill:#7f8c8d,stroke:#5d6d7e,stroke-width:2px,color:#fff;
 
     %% Subgraph: PyQt5 HMI Layer (Asynchronous / Non-Real-Time)
-    subgraph Sub_GUI [PyQt5 HMI Layer — Async / ~20Hz]
+    subgraph Sub_GUI [PyQt5 HMI Layer — Async / ~30Hz]
         UI[PyQt5 GUI Window]:::PyQt
         Worker[ROS2Worker Thread]:::PyQt
         SysID[SysIdEngine]:::PyQt
@@ -51,18 +56,21 @@ graph TB
         Worker <-->|Least Squares Fitting| SysID
     end
 
-    %% Subgraph: MoveIt2 Planning Space (~50Hz On-Demand)
-    subgraph Sub_MoveIt [MoveIt2 Planning Space — ~50Hz]
-        MGroup[MoveGroup Node]:::MoveIt
-        TracIK[TRAC-IK Kinematics Solver]:::MoveIt
-        Pilz[Pilz Industrial Motion Planner<br/>PTP / LIN / CIRC]:::MoveIt
-        MGroup <-->|Plugin API| TracIK
-        MGroup <-->|Plugin API| Pilz
+    %% Subgraph: Custom Industrial Planning Engine
+    subgraph Sub_Planner [Industrial Planning Engine — C++ Async]
+        Action[IndustrialMotion Action Server]:::Planner
+        KinEngine[KinematicsEngine<br/>Analytical IK & Singularity Checker]:::Planner
+        Coal[Coal HPP-FCL<br/>3D Collision Avoidance]:::Planner
+        Ruckig[Ruckig OTG<br/>Trajectory Generation]:::Planner
+        
+        Action <-->|Validates Target & Interpolation| KinEngine
+        Action <-->|Checks Mid-air Collision| Coal
+        Action <-->|Generates Time-optimal Profile| Ruckig
     end
 
     %% Subgraph: Hard Real-Time ROS 2 Control Loop (1000Hz)
     subgraph Sub_R2C [ROS 2 Control Manager — Hard Real-Time 1000Hz Loop]
-        JTC[JointTrajectoryController<br/>Upstream Interpolator]:::R2C
+        JTC[JointTrajectoryController<br/>Upstream Spline Interpolator]:::R2C
         CTC[Lite6CTCController<br/>Downstream CTC Controller]:::Custom
         JSB[JointStateBroadcaster]:::R2C
         KF[1D Kalman Filter<br/>State Observer]:::Custom
@@ -88,8 +96,8 @@ graph TB
     end
 
     %% System Connections (Data Flow)
-    Worker -->|Action Goal:<br/>MoveGroup.Action| MGroup
-    MGroup ==>|Action Goal:<br/>FollowJointTrajectory| JTC
+    Worker -->|Action Goal:<br/>IndustrialMotion.action| Action
+    Ruckig ==>|Action Goal:<br/>FollowJointTrajectory| JTC
     Worker -.->|Software E-Stop<br/>Injects zero-velocity pt| JTC
     
     %% CTC Inputs & Outputs
@@ -108,7 +116,7 @@ graph TB
 
     %% Frequencies & Details annotations
     style Sub_GUI fill:#f4f6f9,stroke:#bdc3c7,stroke-width:2px;
-    style Sub_MoveIt fill:#ebf5fb,stroke:#a9cce3,stroke-width:2px;
+    style Sub_Planner fill:#ebf5fb,stroke:#a9cce3,stroke-width:2px;
     style Sub_R2C fill:#f5eef8,stroke:#d7bde2,stroke-width:2px;
     style Sub_MuJoCo fill:#eaf2f8,stroke:#a9dfbf,stroke-width:2px;
     style Sub_Display fill:#f2f4f4,stroke:#ccd1d1,stroke-width:2px;
@@ -118,24 +126,26 @@ graph TB
 
 ### 1. Industrial Motion Planning (PTP, MoveL, MoveC)
 
-*   **PTP (Point-to-Point):** Joint space planning to specific angles or Cartesian poses (MoveP) via TRAC-IK:
+*   **PTP (Point-to-Point):** Joint space planning (MoveJ) or Cartesian target planning (MoveP) utilizing the optimal inverse kinematic configuration.
 <p align="center">
-  <img src="media/demo_PTP.gif" width="1080" alt="PTP Motion Planning"/>
+  <img src="media/demo_MoveJ.gif" width="1080" alt="Joint PTP Motion Planning"/>
 </p>
 
-*   **MoveL:** Deterministic linear Cartesian interpolation via the Pilz planner:
+<p align="center">
+  <img src="media/demo_MoveP.gif" width="1080" alt="Cartesian PTP Motion Planning"/>
+</p>
+
+*   **MoveL:** Deterministic linear Cartesian interpolation using SLERP for quaternion orientation and Jacobian pseudoinverse mapping.
 
 <p align="center">
   <img src="media/demo_MoveL.gif" width="1080" alt="Linear Interpolation and Planning"/>
 </p>
 
-*   **MoveC:** Circular Cartesian interpolation using an auxiliary midpoint frame:
+*   **MoveC:** Circular Cartesian interpolation using an auxiliary midpoint frame.
 
 <p align="center">
   <img src="media/demo_MoveC.gif" width="1080" alt="Circular Interpolation and Planning"/>
 </p>
-
-*(Note: For MoveL and MoveC, it is recommended to lower the velocity and acceleration scale, to make sure that the trajectory planning doesn't exceed the robot's physical limits; otherwise, trajectory planning may fail.)*
 
 ### 2. Automated System Identification
 *   The automated system identification executes bounded Fourier excitation trajectories, records $q, \dot{q}, \tau$, and utilizes **Least Squares Optimization** to extract exact **Armature, Viscous Friction, and Coulomb Friction** matrices.
@@ -152,7 +162,7 @@ graph TB
 </p>
 
 ### 4. Software E-Stop and Recovery
-*   The emergency stop overrides MoveIt and generates a safe deceleration trajectory based on physical kinematic limits.
+*   The emergency stop overrides the current trajectory and generates a safe deceleration trajectory based on physical kinematic limits.
 
 <p align="center">
   <img src="media/demo_estop.gif" width="1080" alt="E-Stop"/>
@@ -160,7 +170,7 @@ graph TB
 
 ## 🚀 Quick Start & Reproduction Guide
 
-You can run this project using either a containerized Docker environment (recommended for avoiding dependency conflicts) or natively on Ubuntu 22.04.
+You can run this project using either a containerized Docker environment (recommended for avoiding dependency conflicts) or natively on Ubuntu 24.04.
 
 ### 📋 Prerequisites
 
@@ -168,7 +178,7 @@ Download the repository and organize your workspace as follows:
 ```text
 ~/lite6_ws/
 ├── mujoco-3.9.0/          # MuJoCo binaries (provided in this repository)
-├── src/                   # Source code (lite6_bringup, lite6_controllers, etc.)
+├── src/                   # Source code (lite6_bringup, lite6_planner, etc.)
 ├── Dockerfile             # Docker configuration
 ├── run_docker.sh          # Container boot script
 └── README.md
@@ -190,8 +200,8 @@ colcon build --symlink-install
 source install/setup.bash
 ros2 launch lite6_bringup system_bringup.launch.py
 ```
-### 💻 Option B: Native Deployment (Ubuntu 22.04)
-If you prefer running natively, ensure you have **ROS2 Humble** installed on your host machine.
+### 💻 Option B: Native Deployment (Ubuntu 24.04)
+If you prefer running natively, ensure you have **ROS2 Jazzy** installed on your host machine.
 
 **1. Setup MuJoCo Binaries:**
 Move the provided MuJoCo binaries to your home directory and link them to your `.bashrc`.
@@ -206,7 +216,7 @@ source ~/.bashrc
 ```
 
 **2. Install ROS 2 Dependencies (`rosdep`):**
-Use `rosdep` to automatically install all required packages (Pinocchio, MoveIt2, etc.).
+Use `rosdep` to automatically install all required packages (Pinocchio, Coal, Ruckig, etc.).
 ```bash
 cd ~/lite6_ws
 rosdep update
@@ -222,9 +232,9 @@ ros2 launch lite6_bringup system_bringup.launch.py
 
 ## 🔮 Future Work
 This framework is actively evolving. Upcoming features include:
-- **Analytical Inverse Kinematics via Symbolic Computation:** Transitioning from the current numerical IK solver to a mathematically exact, closed-form analytical IK solution. Derived using symbolic computation software, this will reduce IK computation time from milliseconds to nanoseconds, guarantee thread safety, and provide all possible joint configurations instantly.
-- **Algebraic Singularity Analysis & Avoidance:** Leveraging symbolic algebraic derivation to explicitly solve the roots of the Jacobian determinant ($\det(J(q)) = 0$). This will map the exact analytical boundaries of the manipulator's kinematic singularities.
 - **End-Effector Integration:** Adding URDF and controller support for parallel jaw grippers to facilitate pick-and-place tasks.
+- **Friction Modeling Improvement:** Replacing the current model with the LuGre friction model.
+- **Advanced Control Algorithms:** Impedance control, admittance control, etc.
 
 ## 🙏 Acknowledgements
 
@@ -234,9 +244,8 @@ I would like to sincerely thank the creators and maintainers of the following op
 *   **[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)**
 *   **[ros2_control](https://control.ros.org/)**
 *   **[Pinocchio](https://stack-of-tasks.github.io/pinocchio/)**
-*   **[MoveIt2](https://moveit.ai/)**
-*   **[Pilz Industrial Motion Planner](https://moveit.picknik.ai/main/doc/how_to_guides/pilz_industrial_motion_planner/pilz_industrial_motion_planner.html)**
-*   **[TRAC-IK](https://traclabs.com/projects/trac-ik/)**
+*   **[Coal / HPP-FCL](https://github.com/coal-library/coal)**
+*   **[Ruckig](https://ruckig.com/)**
 
 ## 📌 Disclaimer
 
