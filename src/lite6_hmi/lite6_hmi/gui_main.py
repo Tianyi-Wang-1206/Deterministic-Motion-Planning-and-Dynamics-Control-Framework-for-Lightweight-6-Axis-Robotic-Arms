@@ -1207,8 +1207,14 @@ class PyQtHMI(QMainWindow):
             if abs(ui_val - ui_str_of_exact) < 1e-6:
                 target[i] = exact_storage[i]
             else:
-                target[i] = math.radians(ui_val)
+                # Wrap angle to [-180, 180] degrees before converting to radians
+                wrapped_val = ((ui_val + 180.0) % 360.0) - 180.0
+                target[i] = math.radians(wrapped_val)
                 exact_storage[i] = target[i]
+
+                entries[i].blockSignals(True)
+                entries[i].setText(f"{wrapped_val:.2f}")
+                entries[i].blockSignals(False)
                 
         return target
 
