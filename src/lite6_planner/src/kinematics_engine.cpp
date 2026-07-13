@@ -176,8 +176,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t10 = 0.2500e4 / 0.1001e4 * t9;
     t11 = 0.640000e6 / 0.1001e4 * t8 + t10 - 0.14842517e8 / 0.308000000e9;
     t8 = -pow(t11, 0.2e1) + t6 * t8 + t9;
-    if (t8 < 0.0) t8 = 0.0;   // Ensure non-negative before sqrt
-    t8 = sqrt(t8);
+
+    if (t8 < -1e-5) {
+        t8 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t8 < 0.0) {
+        t8 = 0.0;
+    }
+
+    t8 = std::sqrt(t8);   // Ensure non-negative before sqrt
     t12 = atan2(t11, -t8);
     t13 = 0.16e2;
     t14 = atan2(t1, t13 * t7);
@@ -203,8 +209,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t16 = t16 * t17;
     t17 = t13 * t21 * t24 + t16 * R33;
     t27 = -pow(t17, 0.2e1) + 0.1e1;
-    if (t27 < 0.0) t27 = 0.0;
-    t27 = sqrt(t27);
+
+    if (t27 < -1e-5) {
+        t27 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t27 < 0.0) {
+        t27 = 0.0;
+    }
+
+    t27 = std::sqrt(t27);
     t17 = -t17;
     t28 = R12 * t3 + R22 * t2;
     t29 = -t13 * t21 * t28 - t16 * R32;
@@ -225,8 +237,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t7 = t7 * t14;
     t14 = t13 * t20 * t24 + t7 * R33;
     t24 = -pow(t14, 0.2e1) + 0.1e1;
-    if (t24 < 0.0) t24 = 0.0;
-    t24 = sqrt(t24);
+
+    if (t24 < -1e-5) {
+        t24 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t24 < 0.0) {
+        t24 = 0.0;
+    }
+    
+    t24 = std::sqrt(t24);
     t14 = -t14;
     t28 = -t13 * t20 * t28 - t7 * R32;
     t7 = t13 * t20 * t30 + t7 * R31;
@@ -235,8 +253,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t31 = pow(t30, 0.2e1);
     t10 = 0.640000e6 / 0.1001e4 * t31 + t10 - 0.14842517e8 / 0.308000000e9;
     t6 = -pow(t10, 0.2e1) + t31 * t6 + t9;
-    if (t6 < 0.0) t6 = 0.0;
-    t6 = sqrt(t6);
+
+    if (t6 < -1e-5) {
+        t6 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t6 < 0.0) {
+        t6 = 0.0;
+    }
+
+    t6 = std::sqrt(t6);
     t9 = atan2(t10, -t6);
     t1 = atan2(t1, t13 * t30);
     t31 = t9 - t1;
@@ -257,8 +281,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t32 = t32 * t33;
     t33 = t13 * t35 * t36 + t32 * R33;
     t39 = -pow(t33, 0.2e1) + 0.1e1;
-    if (t39 < 0.0) t39 = 0.0;
-    t39 = sqrt(t39);
+
+    if (t39 < -1e-5) {
+        t39 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t39 < 0.0) {
+        t39 = 0.0;
+    }
+
+    t39 = std::sqrt(t39);
     t33 = -t33;
     t40 = -R12 * t3 - R22 * t2;
     t41 = -t13 * t35 * t40 - t32 * R32;
@@ -279,8 +309,14 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     t6 = t19 * t6;
     t18 = t13 * t36 * t5 + t6 * R33;
     t19 = -pow(t18, 0.2e1) + 0.1e1;
-    if (t19 < 0.0) t19 = 0.0;
-    t19 = sqrt(t19);
+
+    if (t19 < -1e-5) {
+        t19 = std::numeric_limits<double>::quiet_NaN(); 
+    } else if (t19 < 0.0) {
+        t19 = 0.0;
+    }
+    
+    t19 = std::sqrt(t19);
     t18 = -t18;
     t23 = -t13 * t40 * t5 - t6 * R32;
     t2 = t13 * t2 * t5 + t6 * R31;
@@ -295,28 +331,42 @@ void KinematicsEngine::raw_inverse_kinematics(const Eigen::Matrix4d& T, double c
     cg0[7][0] = t20; cg0[7][1] = t10; cg0[7][2] = -t1; cg0[7][3] = atan2(-t38, -t22); cg0[7][4] = atan2(t19, t18);  cg0[7][5] = atan2(-t23, -t2);
 }
 
-bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T, 
-                                        const std::array<double, 6>& q_ref, 
-                                        std::vector<std::array<double, 6>>& valid_solutions_sorted,
-                                        bool is_continuous_path)
+IKResult KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T, 
+                                            const std::array<double, 6>& q_ref, 
+                                            std::vector<std::array<double, 6>>& valid_solutions_sorted,
+                                            bool is_continuous_path)
 {
     double cg0[8][6];
     raw_inverse_kinematics(T, cg0);
 
     std::vector<IKSolution> candidate_solutions;
 
+    // Trackers for failure diagnostics
+    bool has_valid_math = false;
+    int collision_or_limit_count = 0;
+    int quadrant_jump_count = 0;
+
     for (int i = 0; i < 8; ++i) {
         std::array<double, 6> current_sol;
         bool limits_violated = false;
         double dist = 0.0;
         bool quadrant_jumped = false;
+        bool math_invalid = false;
 
-        // 1. Find the closest valid joint angles (handling -2pi to 2pi wrap-around)
+        // 1. Process mathematical solutions and enforce physical joint limits
         for (int j = 0; j < 6; ++j) {
             double q_base = cg0[i][j];
+            
+            // If the math solver outputs NaN, this branch is mathematically unreachable
+            if (std::isnan(q_base)) {
+                math_invalid = true;
+                break;
+            }
+
             double best_q_j = q_base;
             double min_j_dist = std::numeric_limits<double>::max();
             
+            // Search across -2pi to 2pi wraparounds to find the nearest valid angle
             for (int k = -2; k <= 2; ++k) {
                 double test_q = q_base + k * 2.0 * M_PI;
                 if (test_q >= joint_limits_[j].min_pos - 1e-4 && test_q <= joint_limits_[j].max_pos + 1e-4) {
@@ -333,22 +383,34 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
                 break;
             }
 
+            // For continuous paths (MoveL/MoveC), prevent sudden >180 deg flips
             if (is_continuous_path && min_j_dist > quadrant_jump_threshold_) {
                 quadrant_jumped = true;
                 break;
             }
 
             current_sol[j] = best_q_j;
-            
             double weights[6] = {1.5, 1.5, 1.2, 1.0, 1.0, 0.8};
             dist += weights[j] * min_j_dist * min_j_dist;
         }
 
-        if (limits_violated || quadrant_jumped) continue;
+        if (math_invalid) continue;
+        has_valid_math = true;
 
-        // --- Hardware limit valid, now perform rigid HPP-FCL collision check ---
+        if (limits_violated) {
+            collision_or_limit_count++;
+            continue;
+        }
+        
+        if (quadrant_jumped) {
+            quadrant_jump_count++;
+            continue;
+        }
+
+        // 2. Hardware limit valid, perform rigid HPP-FCL collision check (Self + Ground)
         if (check_collision(current_sol)) {
-            continue; // Reject this IK solution due to self-collision or ground collision
+            collision_or_limit_count++;
+            continue; // Rejected due to physical collision
         }
 
         IKSolution valid_sol;
@@ -357,14 +419,20 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
         candidate_solutions.push_back(valid_sol);
     }
 
+    // --- Diagnostic Output if no candidates survived ---
     if (candidate_solutions.empty()) {
-        return false; // ERR_NO_IK_SOLUTION or ERR_COLLISION
+        if (!has_valid_math) return IKResult::ERR_NO_MATH_SOLUTION;
+        // Collision has higher diagnostic priority than quadrant jumps
+        if (collision_or_limit_count > 0) return IKResult::ERR_LIMIT_OR_COLLISION;
+        if (quadrant_jump_count > 0) return IKResult::ERR_QUADRANT_JUMP;
+        
+        return IKResult::ERR_NO_MATH_SOLUTION; // Fallback
     }
 
-    // 2. Sort solutions based on minimum movement effort
+    // 3. Sort solutions based on minimum movement effort
     std::sort(candidate_solutions.begin(), candidate_solutions.end());
 
-    // 3. Final filter: Reject solutions inside a singularity zone (if in continuous mode)
+    // 4. Final filter: Reject solutions inside a singularity zone
     valid_solutions_sorted.clear();
     for (const auto& sol : candidate_solutions) {
         if (is_continuous_path && std::abs(check_singularity(sol.q)) < singularity_threshold_) {
@@ -373,7 +441,11 @@ bool KinematicsEngine::solve_optimal_ik(const Eigen::Matrix4d& T,
         valid_solutions_sorted.push_back(sol.q);
     }
 
-    return !valid_solutions_sorted.empty();
+    if (valid_solutions_sorted.empty()) {
+        return IKResult::ERR_SINGULARITY; // All otherwise valid solutions hit a singularity
+    }
+
+    return IKResult::SUCCESS;
 }
 
 } // namespace lite6_planner

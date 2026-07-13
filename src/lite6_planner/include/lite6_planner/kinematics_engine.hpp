@@ -28,6 +28,15 @@ struct CartesianLimit {
     double max_rot_acc;
 };
 
+// Detailed error codes for inverse kinematics failure analysis
+enum class IKResult {
+    SUCCESS = 1,
+    ERR_NO_MATH_SOLUTION = -2, // Target is out of physical workspace
+    ERR_LIMIT_OR_COLLISION = -3, // Hits joint limits or physical collision (Self/Ground)
+    ERR_SINGULARITY = -4,      // Inside a singularity zone
+    ERR_QUADRANT_JUMP = -5     // Requires a sudden joint flip (prevented in MoveL/MoveC)
+};
+
 // --- Structure to hold evaluated IK solutions for sorting ---
 struct IKSolution {
     std::array<double, 6> q;
@@ -53,11 +62,11 @@ public:
     bool init_robot_model(const std::string& urdf_path, const std::string& srdf_path);
 
     // --- Returns a sorted list of all VALID IK solutions ---
-    // is_continuous_path = true (e.g., MoveL/MoveC), strictly prohibit quadrant jumps
-    bool solve_optimal_ik(const Eigen::Matrix4d& T, 
-                          const std::array<double, 6>& q_ref, 
-                          std::vector<std::array<double, 6>>& valid_solutions_sorted,
-                          bool is_continuous_path);
+    // Returns IKResult instead of bool to provide precise failure reasons
+    IKResult solve_optimal_ik(const Eigen::Matrix4d& T, 
+                              const std::array<double, 6>& q_ref, 
+                              std::vector<std::array<double, 6>>& valid_solutions_sorted,
+                              bool is_continuous_path);
 
     // Calculate the singularity measure based on the Jacobian determinant (Maple generated)
     double check_singularity(const std::array<double, 6>& q) const;
