@@ -70,7 +70,7 @@ graph TB
 
     %% Subgraph: Hard Real-Time ROS 2 Control Loop (1000Hz)
     subgraph Sub_R2C [ROS 2 Control Manager — Hard Real-Time 1000Hz Loop]
-        JTC[JointTrajectoryController<br/>Upstream Spline Interpolator]:::R2C
+        JTC[JointTrajectoryController<br/>Reference Forwarder & Fine Interpolator]:::R2C
         CTC[Lite6CTCController<br/>Downstream CTC Controller]:::Custom
         JSB[JointStateBroadcaster]:::R2C
         KF[1D Kalman Filter<br/>State Observer]:::Custom
@@ -97,7 +97,7 @@ graph TB
 
     %% System Connections (Data Flow)
     Worker -->|Action Goal:<br/>IndustrialMotion.action| Action
-    Ruckig ==>|Action Goal:<br/>FollowJointTrajectory| JTC
+    Action ==>|Action Goal:<br/>FollowJointTrajectory| JTC
     Worker -.->|Software E-Stop<br/>Injects zero-velocity pt| JTC
     
     %% CTC Inputs & Outputs

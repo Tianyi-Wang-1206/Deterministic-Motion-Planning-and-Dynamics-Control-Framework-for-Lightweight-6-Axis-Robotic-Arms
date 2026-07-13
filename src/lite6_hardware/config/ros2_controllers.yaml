@@ -9,7 +9,7 @@ controller_manager:
     ctc_controller:
       type: lite6_controllers/Lite6CTCController
 
-    # 2. Declare the native JTC, MoveIt will send trajectories to it
+    # 2. Declare the native JTC
     lite6_arm_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
@@ -47,7 +47,7 @@ ctc_controller:
     max_effort : [50.0, 50.0, 32.0, 32.0, 32.0, 20.0]
 
     # Deceleration (rad/s^2) of each joint when the emergency stop is triggered. This is used to compute the deceleration trajectory for each joint.
-    estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits in the joint_limits.yaml file in the lite6_moveit_config package.
+    estop_decel: [17.5, 12.5, 20.0, 40.0, 40.0, 50.0]  # 5x of the joint acceleration limits.
 
 # --- Joint Trajectory Control (JTC) Configuration ---
 lite6_arm_controller:

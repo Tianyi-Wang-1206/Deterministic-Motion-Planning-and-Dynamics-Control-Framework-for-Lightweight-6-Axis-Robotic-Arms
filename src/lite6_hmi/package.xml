@@ -10,7 +10,6 @@
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>tf2_ros</depend>
-  <depend>moveit_msgs</depend>
   <depend>geometry_msgs</depend>
   <exec_depend>python3-pyqt5</exec_depend>
   <exec_depend>python3-scipy</exec_depend>

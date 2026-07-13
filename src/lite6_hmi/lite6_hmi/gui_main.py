@@ -231,9 +231,9 @@ class ROS2Worker(QThread):
         else:
             self.send_industrial_goal(goal)
 
-    def execute_pose_target(self, target_pose, v_scale, a_scale, planner_id):
+    def execute_pose_target(self, target_pose, v_scale, a_scale, command_type):
         goal = IndustrialMotion.Goal()
-        goal.command_type = IndustrialMotion.Goal.MOVEP if planner_id == 'PTP' else IndustrialMotion.Goal.MOVEL
+        goal.command_type = command_type
         goal.pose_target = self._array_to_pose_msg(target_pose)
         goal.velocity_scale = float(v_scale)
         goal.acceleration_scale = float(a_scale)
@@ -304,19 +304,6 @@ class ROS2Worker(QThread):
             if self.current_goal_handle is not None:
                 self.current_goal_handle.cancel_goal_async()
                 self.current_goal_handle = None
-
-            stop_traj = JointTrajectory()
-            stop_traj.joint_names = self.joint_names
-            
-            pt = JointTrajectoryPoint()
-            pt.positions = list(self.q_curr)
-            pt.velocities = [0.0] * 6
-            pt.accelerations = [0.0] * 6
-            
-            pt.time_from_start = Duration(sec=0, nanosec=10_000_000) 
-            
-            stop_traj.points.append(pt)
-            self.jtc_pub.publish(stop_traj)
 
         self.node.get_logger().error(f"E-STOP ENGAGED: {msg}")
 
@@ -447,16 +434,16 @@ class ROS2Worker(QThread):
 
     def get_planner_error_str(self, code):
         mapping = {
-            1: "Success",
-           -1: "Invalid Input Parameters",
-           -2: "No IK Solution (Unreachable)",
-           -3: "Physical Limit Violation",
-           -4: "Singularity Detected in Path",
-           -5: "Quadrant Jump (Pose Flip) Prevented",
-           -6: "Ruckig Trajectory Generation Failed",
-           -7: "Execution Aborted / Preempted"
+            IndustrialMotion.Result.SUCCESS: "Success",
+            IndustrialMotion.Result.ERR_INVALID_INPUT: "Invalid Input Parameters",
+            IndustrialMotion.Result.ERR_NO_IK_SOLUTION: "No IK Solution (Target Unreachable)",
+            IndustrialMotion.Result.ERR_LIMIT_VIOLATION: "Physical Limit / Collision Violation",
+            IndustrialMotion.Result.ERR_SINGULARITY: "Kinematic Singularity Detected",
+            IndustrialMotion.Result.ERR_QUADRANT_JUMP: "Quadrant Jump (Pose Flip) Prevented",
+            IndustrialMotion.Result.ERR_RUCKIG_FAILED: "Trajectory Generation Failed",
+            IndustrialMotion.Result.ERR_EXECUTION_ABORTED: "Execution Aborted / Preempted"
         }
-        return mapping.get(code, f"ErrorCode ({code})")
+        return mapping.get(code, f"Unknown ErrorCode ({code})")
 
 
 class PyQtHMI(QMainWindow):
@@ -1228,14 +1215,14 @@ class PyQtHMI(QMainWindow):
     def cmd_move_p(self):
         try:
             target = self._parse_cartesian_entries(self.p_entries, self.exact_p_target)
-            self.worker.execute_pose_target(target, self.v_var_val(), self.a_var_val(), 'PTP')
+            self.worker.execute_pose_target(target, self.v_var_val(), self.a_var_val(), IndustrialMotion.Goal.MOVEP)
         except Exception as e:
             QMessageBox.critical(self, "Command Fault", f"Invalid input parsed: {e}")
 
     def cmd_move_l(self):
         try:
             target = self._parse_cartesian_entries(self.p_entries, self.exact_p_target)
-            self.worker.execute_pose_target(target, self.v_var_val(), self.a_var_val(), 'LIN')
+            self.worker.execute_pose_target(target, self.v_var_val(), self.a_var_val(), IndustrialMotion.Goal.MOVEL)
         except Exception as e:
             QMessageBox.critical(self, "Command Fault", f"Invalid input parsed: {e}")
 
