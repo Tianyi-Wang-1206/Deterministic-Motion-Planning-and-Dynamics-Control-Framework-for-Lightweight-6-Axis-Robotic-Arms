@@ -98,7 +98,6 @@ graph TB
     %% System Connections (Data Flow)
     Worker -->|Action Goal:<br/>IndustrialMotion.action| Action
     Action ==>|Action Goal:<br/>FollowJointTrajectory| JTC
-    Worker -.->|Software E-Stop<br/>Injects zero-velocity pt| JTC
     
     %% CTC Inputs & Outputs
     HW -->|Hardware State Interface<br/>Raw q_measured| KF
