@@ -58,8 +58,8 @@ graph TB
 
     %% Subgraph: Custom Industrial Planning Engine
     subgraph Sub_Planner [Industrial Planning Engine — C++ Async]
-        Action[IndustrialMotion Action Server]:::Planner
-        KinEngine[KinematicsEngine<br/>Analytical IK & Singularity Checker]:::Planner
+        Action[IndustrialMotion<br/>Action Server]:::Planner
+        KinEngine[KinematicsEngine<br/>Analytical IK &<br/>Singularity Checker]:::Planner
         Coal[Coal HPP-FCL<br/>3D Collision Avoidance]:::Planner
         Ruckig[Ruckig OTG<br/>Trajectory Generation]:::Planner
         
@@ -70,7 +70,7 @@ graph TB
 
     %% Subgraph: Hard Real-Time ROS 2 Control Loop (1000Hz)
     subgraph Sub_R2C [ROS 2 Control Manager — Hard Real-Time 1000Hz Loop]
-        JTC[JointTrajectoryController<br/>Reference Forwarder & Fine Interpolator]:::R2C
+        JTC[JointTrajectoryController<br/>Reference Forwarder &<br/>Fine Interpolator]:::R2C
         CTC[Lite6CTCController<br/>Downstream CTC Controller]:::Custom
         JSB[JointStateBroadcaster]:::R2C
         KF[1D Kalman Filter<br/>State Observer]:::Custom
@@ -91,7 +91,7 @@ graph TB
 
     %% Subgraph: Shadow Robot Twin (Visualization Helper)
     subgraph Sub_Display [Robot Graphical Display — 200Hz]
-        ShadowRSP[Shadow Robot State Publisher]:::Util
+        ShadowRSP[Shadow Robot<br/>State Publisher]:::Util
         RViz[RViz2 Visualization]:::Util
     end
 
