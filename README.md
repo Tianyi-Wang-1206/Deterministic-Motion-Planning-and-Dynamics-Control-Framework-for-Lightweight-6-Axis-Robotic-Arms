@@ -63,9 +63,9 @@ graph TB
         Coal[Coal HPP-FCL<br/>3D Collision Avoidance]:::Planner
         Ruckig[Ruckig OTG<br/>Trajectory Generation]:::Planner
         
-        Action <-->|Validates Target & Interpolation| KinEngine
+        Action <-->|Validates Target &<br/>Interpolation| KinEngine
         Action <-->|Checks Mid-air Collision| Coal
-        Action <-->|Generates Time-optimal Profile| Ruckig
+        Action <-->|Generates<br/>Time-optimal Profile| Ruckig
     end
 
     %% Subgraph: Hard Real-Time ROS 2 Control Loop (1000Hz)
