@@ -1,13 +1,13 @@
 #!/bin/bash
 
-echo "Starting Lite6 ROS 2 Docker Environment..."
+echo "Starting Lite6 ROS 2 Jazzy Docker Environment..."
 
 # 1. Allow local X11 connections (Required for PyQt5 and RViz GUI)
 xhost +local:root
 
-# 2. Define the container name and image name
-IMAGE_NAME="lite6_mujoco_env"
-CONTAINER_NAME="lite6_container"
+# 2. Define the container name and image name (Updated for Jazzy to avoid cache conflicts)
+IMAGE_NAME="lite6_jazzy_mujoco_env"
+CONTAINER_NAME="lite6_jazzy_container"
 
 # 3. Build the Docker image if it doesn't exist yet
 if [[ "$(docker images -q $IMAGE_NAME 2> /dev/null)" == "" ]]; then
@@ -25,7 +25,6 @@ elif [ -d "/dev/dri" ]; then
     GPU_FLAGS="--device=/dev/dri:/dev/dri"
 else
     echo "🟡 No GPU detected. RViz2 and MuJoCo will run using CPU software rendering (expect low FPS)."
-    # Optional: Force software rendering environment variable if needed
     GPU_FLAGS="--env=LIBGL_ALWAYS_SOFTWARE=1"
 fi
 
