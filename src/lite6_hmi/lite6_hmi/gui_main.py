@@ -1020,20 +1020,45 @@ class PyQtHMI(QMainWindow):
         self.btn_copy.clicked.connect(self.cmd_copy_yaml)
         out_layout.addWidget(self.btn_copy)
 
+    def sanitize_angle(self, angle_deg, min_limit, max_limit):
+        """
+        Modulo wrapping and boundary clamping (Congruence Reduction & Clamping).
+        """
+        # 1. If already within limits, preserve the original value
+        if min_limit <= angle_deg <= max_limit:
+            return angle_deg
+            
+        # 2. Try wrapping to the intuitive [-180, 180] degree range
+        wrapped_180 = ((angle_deg + 180.0) % 360.0) - 180.0
+        if min_limit <= wrapped_180 <= max_limit:
+            return wrapped_180
+            
+        # 3. Try wrapping to the baseline range [min_limit, min_limit + 360]
+        wrapped_min = ((angle_deg - min_limit) % 360.0) + min_limit
+        if min_limit <= wrapped_min <= max_limit:
+            return wrapped_min
+            
+        # 4. Fallback: Force clamping to physical boundaries
+        return max(min_limit, min(max_limit, angle_deg))
+
     # === Synchronous slider-entry pairing utility ===
     def connect_joint_pair(self, slider, entry, idx):
         """Map QSlider (integer based) and QLineEdit (float validation) bidirectionally."""
         def slider_moved(val):
-            # Block signals to prevent cyclic loop updates
             entry.blockSignals(True)
-            entry.setText(f"{val / 100.0:.2f}")
+            deg_val = val / 100.0
+            entry.setText(f"{deg_val:.2f}")
             entry.blockSignals(False)
+            self.exact_q_target[idx] = math.radians(deg_val)
             
         def entry_edited():
             try:
                 val = float(entry.text())
                 lim = self.j_limits[idx]
-                val = max(lim[0], min(val, lim[1]))
+                
+                # Sanitize and intercept manual user input
+                val = self.sanitize_angle(val, lim[0], lim[1])
+                
                 entry.blockSignals(True)
                 entry.setText(f"{val:.2f}")
                 entry.blockSignals(False)
@@ -1041,6 +1066,8 @@ class PyQtHMI(QMainWindow):
                 slider.blockSignals(True)
                 slider.setValue(int(val * 100))
                 slider.blockSignals(False)
+                
+                self.exact_q_target[idx] = math.radians(val)
             except ValueError:
                 pass
 
@@ -1146,10 +1173,23 @@ class PyQtHMI(QMainWindow):
             q_copied = list(self.worker.q_curr)
             
         for i in range(6):
-            self.exact_q_target[i] = q_copied[i]
-            deg_val = math.degrees(q_copied[i])
+            lim = self.j_limits[i]
+            raw_deg = math.degrees(q_copied[i])
+            
+            # Execute congruence reduction and filtering
+            deg_val = self.sanitize_angle(raw_deg, lim[0], lim[1])
+            
+            # Update target registry memory (in radians)
+            self.exact_q_target[i] = math.radians(deg_val)
+            
+            # Update HMI display fields
+            self.j_entries[i].blockSignals(True)
             self.j_entries[i].setText(f"{deg_val:.2f}")
+            self.j_entries[i].blockSignals(False)
+            
+            self.j_sliders[i].blockSignals(True)
             self.j_sliders[i].setValue(int(deg_val * 100))
+            self.j_sliders[i].blockSignals(False)
 
     def _sync_coordinates_to_entries(self, exact_storage, entries):
         with self.worker.state_lock:
@@ -1175,8 +1215,19 @@ class PyQtHMI(QMainWindow):
             target_rad = [0.0] * 6
             for i in range(6):
                 ui_val = float(self.j_entries[i].text())
-                ui_str_of_exact = float(f"{math.degrees(self.exact_q_target[i]):.2f}")
+                lim = self.j_limits[i]
                 
+                # Defensive clamping check
+                clamped_val = self.sanitize_angle(ui_val, lim[0], lim[1])
+                if abs(ui_val - clamped_val) > 1e-4:
+                    self.worker.node.get_logger().warn(
+                        f"J{i+1} target {ui_val}° violated limits. Sanitized to {clamped_val}°"
+                    )
+                    ui_val = clamped_val
+                    self.j_entries[i].setText(f"{clamped_val:.2f}")
+                    self.j_sliders[i].setValue(int(clamped_val * 100))
+                
+                ui_str_of_exact = float(f"{math.degrees(self.exact_q_target[i]):.2f}")
                 if abs(ui_val - ui_str_of_exact) < 1e-6:
                     target_rad[i] = self.exact_q_target[i]
                 else:
@@ -1249,7 +1300,16 @@ class PyQtHMI(QMainWindow):
 
     # === Automated SysID Sequencer Calls ===
     def _parse_sysid_inputs(self):
-        prep_pose = [math.radians(float(entry.text())) for entry in self.sysid_prep_entries]
+        prep_pose = []
+        for i, entry in enumerate(self.sysid_prep_entries):
+            val = float(entry.text())
+            lim = self.j_limits[i]
+            sanitized = self.sanitize_angle(val, lim[0], lim[1])
+            if abs(val - sanitized) > 1e-4:
+                entry.setText(f"{sanitized:.2f}")
+                val = sanitized
+            prep_pose.append(math.radians(val))
+            
         max_limits = [float(entry.text()) for entry in self.sysid_limit_entries]
         return prep_pose, max_limits
 
