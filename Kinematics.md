@@ -86,7 +86,7 @@ $$q_6 = \text{atan2}\left(R'_{22} \cdot \text{sgn}(\sin(q_5)), -R'_{21} \cdot \t
 When $\sin(q_5) = 0$ (Wrist Singularity), axes $Z_4$ and $Z_6$ become collinear, leading to an infinite number of solutions for $q_4$ and $q_6$. In the C++ implementation, this is resolved by convention: $q_4$ is locked to its current physical joint angle ($q_{4, \text{current}}$), and $q_6$ absorbs the remaining required rotation.
 
 ### Part 5: Maple Script for Verifying Kinematics Matrices
-This Maple script varifies the forward kinematics transformations.
+This Maple script verifies the forward kinematics transformations.
 
 ```maple
 restart:
