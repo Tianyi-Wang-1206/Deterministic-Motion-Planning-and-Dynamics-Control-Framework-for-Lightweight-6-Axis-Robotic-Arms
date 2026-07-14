@@ -55,6 +55,9 @@ public:
     
     // Load the physical limits of the robot from YAML
     bool load_limits(const std::string& yaml_path);
+
+    // --- Load IK & Environment Config from YAML ---
+    bool load_ik_config(const std::string& yaml_path);
     
     // --- Initialize the Kinematic and Collision Geometry Models ---
     // This loads the URDF, the STL collision meshes, and prunes the collision
@@ -90,6 +93,11 @@ private:
     CartesianLimit cart_limits_;
     double singularity_threshold_;
     double quadrant_jump_threshold_;
+
+    // --- Externalized configs ---
+    std::vector<double> ground_size_;
+    std::vector<double> ground_pos_;
+    std::array<double, 6> ik_weights_;
 
     // --- Pinocchio Engine Components ---
     pinocchio::Model pin_model_;

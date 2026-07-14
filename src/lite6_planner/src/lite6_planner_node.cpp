@@ -12,7 +12,7 @@
 #include "lite6_interfaces/action/industrial_motion.hpp"
 #include "lite6_planner/kinematics_engine.hpp"
 
-// Ruckig & Pinocchio (No Coal/HPP-FCL headers needed here, fully encapsulated in the engine!)
+// Ruckig & Pinocchio (Encapsulated!)
 #include <ruckig/ruckig.hpp>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
@@ -36,17 +36,26 @@ public:
     using GoalHandleMotion = rclcpp_action::ServerGoalHandle<IndustrialMotion>;
     using FJT = control_msgs::action::FollowJointTrajectory;
 
-    IndustrialPlannerNode() : Node("lite6_industrial_planner")
+    IndustrialPlannerNode() 
+    : Node("lite6_industrial_planner"),
+      otg_ptp_(0.01),
+      otg_cart_(0.01)
     {
-        // 1. Initialize Kinematics Engine (Now includes URDF, SRDF and Collision geometry)
+        // Initialize Kinematics Engine (Now includes URDF, SRDF and Collision geometry)
         std::string pkg_path = ament_index_cpp::get_package_share_directory("lite6_description");
         std::string planner_pkg_path = ament_index_cpp::get_package_share_directory("lite6_planner");
         
         std::string urdf_path = pkg_path + "/urdf/lite6.urdf";
         std::string srdf_path = planner_pkg_path + "/config/lite6.srdf";
         std::string limits_path = planner_pkg_path + "/config/kinematic_limits.yaml";
+        std::string ik_config_path = planner_pkg_path + "/config/ik_config.yaml";
 
-        // --- Initialize the dual-engine (Kinematics + Coal Geometry) ---
+        // --- Load externalized YAML parameters ---
+        if (!kin_engine_.load_ik_config(ik_config_path)) {
+            RCLCPP_FATAL(this->get_logger(), "Failed to load externalized IK Config YAML!");
+            throw std::runtime_error("IK config load failed");
+        }
+
         if (!kin_engine_.init_robot_model(urdf_path, srdf_path)) {
             RCLCPP_FATAL(this->get_logger(), "Failed to initialize URDF/SRDF Geometry Model!");
             throw std::runtime_error("Geometry init failed");
@@ -63,7 +72,7 @@ public:
         current_q_ = Eigen::VectorXd::Zero(6);
         joint_names_ = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
 
-        // 2. Initialize ROS2 subscriptions and action servers
+        // Initialize ROS2 subscriptions and action servers
         js_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10, [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
                 // Thread safety: Acquire unique write lock before updating state
@@ -84,7 +93,7 @@ public:
             std::bind(&IndustrialPlannerNode::handle_cancel, this, _1),
             std::bind(&IndustrialPlannerNode::handle_accepted, this, _1));
 
-        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY (Coal Collision Enabled).");
+        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY (Analytical Joint Accel Enabled).");
     }
 
 private:
@@ -101,20 +110,37 @@ private:
     rclcpp_action::Client<FJT>::SharedPtr jtc_client_;
     rclcpp_action::Server<IndustrialMotion>::SharedPtr action_server_;
 
-    // --- Universal Mid-air Collision Checker using Coal ---
-    // Checks an entire generated trajectory for mid-air collisions (sub-sampled for performance)
+    // --- Pre-allocated Ruckig engines to eliminate dynamic memory footprint ---
+    ruckig::Ruckig<6> otg_ptp_;
+    ruckig::Ruckig<1> otg_cart_;
+
+    // --- Joint displacement-based continuous collision sub-sampling ---
     bool is_trajectory_collision_free(const trajectory_msgs::msg::JointTrajectory& traj) {
         if (traj.points.empty()) return true;
         
-        // Sub-sample: Check every 10th point to save CPU (e.g., check every 0.1s if dt=0.01s)
-        for (size_t i = 0; i < traj.points.size(); i += 10) {
+        const double ACCUMULATED_JOINT_DISPLACEMENT_THRESHOLD = 0.05; // ~3 degrees
+        std::array<double, 6> last_checked_q;
+        for (int j = 0; j < 6; ++j) last_checked_q[j] = traj.points[0].positions[j];
+
+        // Always verify the exact start configuration
+        if (kin_engine_.check_collision(last_checked_q)) return false;
+
+        for (size_t i = 1; i < traj.points.size() - 1; ++i) {
             std::array<double, 6> q;
-            for(int j=0; j<6; ++j) q[j] = traj.points[i].positions[j];
+            double max_diff = 0.0;
+            for (int j = 0; j < 6; ++j) {
+                q[j] = traj.points[i].positions[j];
+                max_diff = std::max(max_diff, std::abs(q[j] - last_checked_q[j]));
+            }
             
-            if (kin_engine_.check_collision(q)) return false;
+            // Execute collision check only when joint displacement exceeds limits
+            if (max_diff >= ACCUMULATED_JOINT_DISPLACEMENT_THRESHOLD) {
+                if (kin_engine_.check_collision(q)) return false;
+                last_checked_q = q;
+            }
         }
         
-        // Always strictly check the exact final point
+        // Always strictly verify the exact final configuration
         std::array<double, 6> q_end;
         for(int j=0; j<6; ++j) q_end[j] = traj.points.back().positions[j];
         if (kin_engine_.check_collision(q_end)) return false;
@@ -215,8 +241,7 @@ private:
             // MOVEP Logic
             Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
             
-            // Local pinocchio calculation using the engine's model
-            pinocchio::Data local_data(kin_engine_.get_pin_model());
+            thread_local pinocchio::Data local_data(kin_engine_.get_pin_model());
             pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
             pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
             
@@ -236,13 +261,13 @@ private:
             std::array<double, 6> q_ref;
             Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
             
+            // Solve Inverse Kinematics for Target Pose
             std::vector<std::array<double, 6>> valid_ik_solutions;
             IKResult ik_res = kin_engine_.solve_optimal_ik(T_goal, q_ref, valid_ik_solutions, false);
             
             if (ik_res != IKResult::SUCCESS) {
                 if (ik_res == IKResult::ERR_NO_MATH_SOLUTION) throw std::runtime_error("NO_IK: Target coordinate is outside the mathematical workspace.");
                 if (ik_res == IKResult::ERR_LIMIT_OR_COLLISION) throw std::runtime_error("COLLISION: Target posture violates joint limits or causes physical collision.");
-                // MoveP usually doesn't trigger continuous path errors, but added for safety
                 if (ik_res == IKResult::ERR_SINGULARITY) throw std::runtime_error("Singularity: Target posture is in a kinematic singularity.");
                 throw std::runtime_error("NO_IK: Failed to find a valid solution.");
             }
@@ -250,15 +275,11 @@ private:
             // --- Multi-solution iteration to avoid mid-air collisions ---
             for (const auto& q_target_candidate : valid_ik_solutions) {
                 Eigen::VectorXd target_q_eig = Eigen::Map<const Eigen::VectorXd>(q_target_candidate.data(), 6);
-                
-                // Target is known to be IK-valid and collision-free, generate its interpolation trajectory
                 auto traj = generate_ruckig_traj(start_q, target_q_eig, goal->velocity_scale, goal->acceleration_scale);
                 
-                // If the dynamic path doesn't hit anything, it's our golden ticket!
                 if (is_trajectory_collision_free(traj)) {
                     return traj;
                 }
-                
                 RCLCPP_WARN(this->get_logger(), "MoveP Priority IK Path implies mid-air collision. Rerouting to next sub-optimal IK solution...");
             }
             
@@ -269,8 +290,6 @@ private:
     // Helper: Extracts Ruckig generation logic for re-use
     trajectory_msgs::msg::JointTrajectory generate_ruckig_traj(const Eigen::VectorXd& start_q, const Eigen::VectorXd& target_q, double v_scale, double a_scale) 
     {
-        double dt = 0.01;
-        ruckig::Ruckig<6> otg(dt);
         ruckig::InputParameter<6> input;
         ruckig::OutputParameter<6> output;
 
@@ -294,7 +313,7 @@ private:
 
         ruckig::Result res;
         do {
-            res = otg.update(input, output);
+            res = otg_ptp_.update(input, output);
             trajectory_msgs::msg::JointTrajectoryPoint pt;
             for (int i = 0; i < 6; ++i) {
                 pt.positions.push_back(output.new_position[i]);
@@ -318,7 +337,7 @@ private:
     // MoveL: Interpolates in Cartesian space and uses IK to find joint configurations along the path
     trajectory_msgs::msg::JointTrajectory plan_line(std::shared_ptr<const IndustrialMotion::Goal> goal)
     {
-        // 1. Safely copy current joint states
+        // Safely copy current joint states
         Eigen::VectorXd start_q;
         {
             std::shared_lock<std::shared_mutex> lock(state_mutex_);
@@ -327,21 +346,20 @@ private:
         
         Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
 
-        // 2. Forward Kinematics for Start Pose
-        pinocchio::Data local_data(kin_engine_.get_pin_model());
+        thread_local pinocchio::Data local_data(kin_engine_.get_pin_model());
         pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
         pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
         pinocchio::SE3 pose_start = local_data.oMf[eef_frame_id_];
         pinocchio::SE3 pose_end(T_goal.block<3,3>(0,0), T_goal.block<3,1>(0,3));
 
-        // 3. Calculate Cartesian Path Distances
+        // Calculate Cartesian Path Distances
         double d_trans = (pose_end.translation() - pose_start.translation()).norm();
         Eigen::AngleAxisd aa(pose_start.rotation().transpose() * pose_end.rotation());
         double d_rot = std::abs(aa.angle());
 
         if (d_trans < 1e-4 && d_rot < 1e-4) throw std::runtime_error("Start and End pose are identical.");
 
-        // 4. Calculate Maximum Allowed Phase Velocity (s_dot) based on Cartesian Limits
+        // Calculate Maximum Allowed Phase Velocity (s_dot) based on Cartesian Limits
         const auto& clim = kin_engine_.get_cartesian_limits();
         double max_s_vel = std::numeric_limits<double>::max();
         double max_s_acc = std::numeric_limits<double>::max();
@@ -355,7 +373,6 @@ private:
             max_s_acc = std::min(max_s_acc, clim.max_rot_acc / d_rot);
         }
 
-        double dt = 0.01;
         trajectory_msgs::msg::JointTrajectory traj;
         traj.joint_names = joint_names_;
         
@@ -366,11 +383,9 @@ private:
         const int MAX_RETRIES = 5;
         bool trajectory_valid = false;
 
-        // 5. Auto-Scaling Loop (Deterministic Time-Scaling)
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
             
-            ruckig::Ruckig<1> otg(dt);
             ruckig::InputParameter<1> input;
             ruckig::OutputParameter<1> output;
             
@@ -383,14 +398,14 @@ private:
 
             std::array<double, 6> q_ref;
             Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
-            Eigen::VectorXd prev_dq = Eigen::VectorXd::Zero(6);
 
             ruckig::Result res;
             try {
                 do {
-                    res = otg.update(input, output);
+                    res = otg_cart_.update(input, output);
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
+                    double dds = output.new_acceleration[0]; // Cartesian phase acceleration
 
                     // Interpolate Cartesian Pose
                     Eigen::Vector3d p_t = pose_start.translation() + s * (pose_end.translation() - pose_start.translation());
@@ -420,17 +435,37 @@ private:
                     pinocchio::Data::Matrix6x J(6, 6);
                     pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
+                    // --- Adaptive Damped Least Squares using Manipulability ---
+                    double manipulability = std::sqrt((J * J.transpose()).determinant());
+                    double lambda = 0.0;
+                    double w_threshold = 0.04; // Safety threshold for Lite6 singularity proximity
+                    if (manipulability < w_threshold) {
+                        lambda = 0.05 * std::pow(1.0 - (manipulability / w_threshold), 2);
+                    }
+
+                    Eigen::MatrixXd J_dls = J.transpose() * (J * J.transpose() + lambda * lambda * Eigen::MatrixXd::Identity(6,6)).inverse();
+                    
                     Eigen::VectorXd V_spatial(6);
                     V_spatial << v_world, w_world;
-                    
-                    // DLS Pseudoinverse
-                    double lambda = 0.01; 
-                    Eigen::MatrixXd J_dls = J.transpose() * (J * J.transpose() + lambda * lambda * Eigen::MatrixXd::Identity(6,6)).inverse();
                     Eigen::VectorXd dq = J_dls * V_spatial;
 
-                    // Discretize Acceleration
-                    Eigen::VectorXd ddq = (dq - prev_dq) / dt;
-                    prev_dq = dq;
+                    // --- Pinocchio Analytical Joint Acceleration Solving ---
+                    // Compute kinematics under actual position & estimated velocity with zero ddq
+                    Eigen::VectorXd ddq_zero = Eigen::VectorXd::Zero(6);
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_eig, dq, ddq_zero);
+
+                    // getFrameAcceleration with ddq=0 returns spatial drift acceleration (J_dot * dq)
+                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(
+                        kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+
+                    // Map Cartesian phase acceleration to desired spatial acceleration
+                    Eigen::Vector3d a_world = dds * (pose_end.translation() - pose_start.translation());
+                    Eigen::Vector3d alpha_world = dds * d_rot * (pose_start.rotation() * aa.axis());
+                    Eigen::VectorXd A_des(6);
+                    A_des << a_world, alpha_world;
+
+                    // Analytical calculation: ddq = J_dls * (A_des - J_dot_dq) -> Perfect math profile
+                    Eigen::VectorXd ddq = J_dls * (A_des - J_dot_dq);
 
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
@@ -444,28 +479,26 @@ private:
                     output.pass_to_input(input);
                 } while (res == ruckig::Result::Working);
             } catch (const std::exception& e) {
-                throw; // Abort entirely on collision/singularity
+                throw; 
             }
 
-            // 6. Strict Physical Limits Violation Check
+            // Strict Physical Limits Violation Check
             double max_violation_ratio = 0.0;
             for (const auto& pt : traj.points) {
                 for (int i = 0; i < 6; ++i) {
                     double v_ratio = std::abs(pt.velocities[i]) / kin_engine_.get_joint_limits()[i].max_vel;
-                    // Physics rule: Acceleration scales with the square of the time scaling factor
                     double a_ratio = std::sqrt(std::abs(pt.accelerations[i]) / kin_engine_.get_joint_limits()[i].max_acc); 
                     
                     max_violation_ratio = std::max({max_violation_ratio, v_ratio, a_ratio});
                 }
             }
 
-            // 7. Deterministic Scaling Logic
+            // Deterministic Scaling Logic
             if (max_violation_ratio <= 1.01) { 
                 trajectory_valid = true;
-                break; // Path is physically feasible!
+                break; 
             } else {
-                // Time-stretch the Cartesian trajectory by the exact violation amount
-                current_v_limit /= (max_violation_ratio * 1.02); // 2% safety margin
+                current_v_limit /= (max_violation_ratio * 1.02); 
                 current_a_limit /= (max_violation_ratio * max_violation_ratio * 1.02); 
                 
                 RCLCPP_INFO(this->get_logger(), "MoveL Joint Limit Exceeded (Ratio: %.2f). Time-scaling applied, retrying...", max_violation_ratio);
@@ -494,7 +527,7 @@ private:
         
         Eigen::Matrix4d T_goal = pose_to_matrix(goal->pose_target);
     
-        pinocchio::Data local_data(kin_engine_.get_pin_model());
+        thread_local pinocchio::Data local_data(kin_engine_.get_pin_model());
         pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, start_q);
         pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
         
@@ -545,7 +578,6 @@ private:
             max_s_acc = std::min(max_s_acc, clim.max_rot_acc / d_rot);
         }
 
-        double dt = 0.01;
         trajectory_msgs::msg::JointTrajectory traj;
         traj.joint_names = joint_names_;
         
@@ -555,11 +587,9 @@ private:
         const int MAX_RETRIES = 5;
         bool trajectory_valid = false;
 
-        // Auto-Scaling Loop (Deterministic Time-Scaling)
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
 
-            ruckig::Ruckig<1> otg(dt);
             ruckig::InputParameter<1> input;
             ruckig::OutputParameter<1> output;
             
@@ -572,14 +602,14 @@ private:
 
             std::array<double, 6> q_ref;
             Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
-            Eigen::VectorXd prev_dq = Eigen::VectorXd::Zero(6);
 
             ruckig::Result res;
             try {
                 do {
-                    res = otg.update(input, output);
+                    res = otg_cart_.update(input, output);
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
+                    double dds = output.new_acceleration[0]; // Cartesian phase acceleration
                     double current_theta = s * total_angle;
 
                     // Interpolate
@@ -603,20 +633,44 @@ private:
                     // Differential Kinematics
                     Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
                     double dtheta_dt = ds * total_angle;
+                    double ddtheta_dt = dds * total_angle;
+
                     Eigen::Vector3d v_world = dtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir);
                     Eigen::Vector3d w_world = ds * d_rot * (q_start * aa.axis());
 
                     pinocchio::Data::Matrix6x J(6, 6);
                     pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
-                    Eigen::VectorXd V_spatial(6); V_spatial << v_world, w_world;
-                    
-                    double lambda = 0.01; 
+                    // --- Adaptive Damped Least Squares using Manipulability ---
+                    double manipulability = std::sqrt((J * J.transpose()).determinant());
+                    double lambda = 0.0;
+                    double w_threshold = 0.04;
+                    if (manipulability < w_threshold) {
+                        lambda = 0.05 * std::pow(1.0 - (manipulability / w_threshold), 2);
+                    }
+
                     Eigen::MatrixXd J_dls = J.transpose() * (J * J.transpose() + lambda * lambda * Eigen::MatrixXd::Identity(6,6)).inverse();
+                    
+                    Eigen::VectorXd V_spatial(6); V_spatial << v_world, w_world;
                     Eigen::VectorXd dq = J_dls * V_spatial;
 
-                    Eigen::VectorXd ddq = (dq - prev_dq) / dt;
-                    prev_dq = dq;
+                    // --- Pinocchio Analytical Joint Acceleration Solving ---
+                    Eigen::VectorXd ddq_zero = Eigen::VectorXd::Zero(6);
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_eig, dq, ddq_zero);
+
+                    // getFrameAcceleration with ddq=0 returns J_dot * dq
+                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(
+                        kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+
+                    // Calculate analytical desired spatial acceleration for circular motion
+                    Eigen::Vector3d a_world = ddtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir) +
+                                              (dtheta_dt * dtheta_dt) * (-radius * std::cos(current_theta) * X_dir - radius * std::sin(current_theta) * Y_dir);
+                    Eigen::Vector3d alpha_world = dds * d_rot * (q_start * aa.axis());
+                    Eigen::VectorXd A_des(6);
+                    A_des << a_world, alpha_world;
+
+                    // Analytical calculation: ddq = J_dls * (A_des - J_dot_dq) -> Perfect math profile
+                    Eigen::VectorXd ddq = J_dls * (A_des - J_dot_dq);
 
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
