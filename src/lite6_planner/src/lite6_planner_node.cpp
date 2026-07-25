@@ -100,6 +100,12 @@ private:
 
     Eigen::VectorXd current_q_;
     std::vector<std::string> joint_names_;
+
+    // Mutex specifically for protecting action server state transitions (Preemption)
+    std::mutex action_mutex_;
+    
+    // Pointer to track the currently executing goal
+    std::shared_ptr<GoalHandleMotion> active_goal_handle_;
     
     // Mutex to prevent data race between ROS spin thread and Execution thread
     std::shared_mutex state_mutex_; 
@@ -155,7 +161,21 @@ private:
     }
 
     void handle_accepted(const std::shared_ptr<GoalHandleMotion>& goal_handle) {
-        std::thread{std::bind(&IndustrialPlannerNode::execute, this, _1), goal_handle}.detach();
+        std::lock_guard<std::mutex> lock(action_mutex_);
+
+        if (active_goal_handle_ && active_goal_handle_->is_active()) {
+            RCLCPP_WARN(this->get_logger(), 
+                "New motion command received! Preempting the currently active trajectory...");
+            auto result = std::make_shared<IndustrialMotion::Result>();
+            result->error_code = IndustrialMotion::Result::ERR_EXECUTION_ABORTED;
+            result->error_string = "Preempted by a new incoming high-priority command.";
+            active_goal_handle_->abort(result);
+            jtc_client_->async_cancel_all_goals();
+        }
+
+        active_goal_handle_ = goal_handle;
+
+        std::thread{std::bind(&IndustrialPlannerNode::execute, this, std::placeholders::_1), goal_handle}.detach();
     }
 
     // Core execution logic
@@ -195,6 +215,12 @@ private:
             goal_handle->abort(result);
             RCLCPP_ERROR(this->get_logger(), "Planning Aborted: %s", err_msg.c_str());
             return;
+        }
+
+        // If this goal was preempted while IK was calculating, quietly terminate this thread
+        if (!goal_handle->is_active()) {
+            RCLCPP_WARN(this->get_logger(), "Goal was preempted during IK calculation. Discarding trajectory.");
+            return; 
         }
 
         // Send the planned trajectory to the JTC action server
