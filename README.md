@@ -5,7 +5,7 @@
 ![Python 3.12](https://img.shields.io/badge/Python-3.12-yellow.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
-This repository presents a high-fidelity, mathematically rigorous 6-axis robotic arm simulation and control framework. Initiated by an asynchronous and detailed GUI (based on PyQt5), the system orchestrates high-level motion using a **custom-built, deterministic C++ planning engine**, bypassing standard frameworks like MoveIt2. This planner leverages a **closed-form Analytical Inverse Kinematics** solver (derived via Maple symbolic computation), combined with **Coal (formerly HPP-FCL)** for 3D collision avoidance and symbolic Jacobian determinant analysis for singularity detection. Trajectory generation is handled by **Ruckig**, providing time-optimal profiles for Joint Space (**MoveJ**), Cartesian Space (**MoveP**), Linear (**MoveL**), and Circular (**MoveC**) Cartesian motions.
+This repository presents a high-fidelity, mathematically rigorous 6-axis robotic arm simulation and control framework. Initiated by an asynchronous and detailed GUI (based on PyQt5), the system orchestrates high-level motion using a **custom-built, deterministic, and thread-safe C++ planning engine**, bypassing standard frameworks like MoveIt2. This planner leverages a **closed-form Analytical Inverse Kinematics** solver (derived via Maple symbolic computation), combined with **Coal (formerly HPP-FCL)** for 3D collision avoidance and symbolic Jacobian determinant analysis for singularity detection. Trajectory generation is handled by **Ruckig** and **Closed-Loop Inverse Kinematics (CLIK)**. CLIK is combined with Jacobian pseudo-inverse (**Damped Least Squares**) and Quaternion **SLERP**. This provides time-optimal profiles for Joint Space (**MoveJ**), Cartesian Space (**MoveP**), Linear (**MoveL**), and Circular (**MoveC**) Cartesian motions.
 
 At the core, **Controller Chaining** (based on **ros2_control**) interpolates these trajectories into a tight 1000Hz reference for a custom **Computed Torque Control (CTC)** downstream controller. To ensure physical realism, the CTC bypasses **MuJoCo**’s default PID joints to run the physics engine in pure **effort mode**. The CTC processes the feedback states via a **1D Kalman Filter** state observation model to reconstruct noise-free joint velocities, and executes **Pinocchio** dynamics calculations to compute rigid-body inertia, gravity, and Coriolis matrices. Combined with **friction/armature compensation** (smoothly neutralizing viscous damping, Coulomb stiction, and motor rotor inertia), this architecture achieves a tracking precision of $<0.01\text{ mm}$.
 
@@ -147,7 +147,7 @@ flowchart TD
 
     %% 3. State Estimator (Zero-Lag Observer)
     subgraph L3 [State Estimation - Zero Lag Observer]
-        KF["1D Kalman Filter (per joint)<br/>---------------------------<br/>Predict: x = F*x + B * ddq_target<br/>Update: x = x + K * (q_measured - x_pos)"]:::calc
+        KF["1D Kalman Filter (per joint)<hr/>Predict: x = F*x + B * ddq_target<br/>Update: x = x + K * (q_measured - x_pos)"]:::calc
         Q_M --> KF
         DDQ_T -. Acceleration Injection .-> KF
         KF --> Q_F([q_filtered]):::data
@@ -174,7 +174,7 @@ flowchart TD
 
         PD --> ARM["Rotor Inertia Compensation<br/>tau_arm = Armature * a_d"]:::calc
 
-        DQ_F --> FRIC["Friction Compensation<br/>---------------------------<br/>Viscous: F_v * dq_filtered<br/>Coulomb: F_c * tanh(slope * (dq_target + 5*e))"]:::calc
+        DQ_F --> FRIC["Friction Compensation<hr/>Viscous: F_v * dq_filtered<br/>Coulomb: F_c * tanh(slope * (dq_target + 5*e))"]:::calc
         DQ_T --> FRIC
         ERR_Q --> FRIC
 
@@ -248,10 +248,17 @@ You can run this project using either a containerized Docker environment (recomm
 Download the repository and organize your workspace as follows:
 ```text
 ~/lite6_ws/
-├── mujoco-3.9.0/          # MuJoCo binaries (provided in this repository)
-├── src/                   # Source code (lite6_bringup, lite6_planner, etc.)
-├── Dockerfile             # Docker configuration
-├── run_docker.sh          # Container boot script
+├── mujoco-3.9.0/           # MuJoCo binaries (provided in this repository)
+├── src/                    # Source code
+│   ├── lite6_bringup/     # Launch files for full system orchestration
+│   ├── lite6_controllers/ # Real-time CTC & Kalman Filter implementation (1000Hz)
+│   ├── lite6_description/ # URDF, Meshes, and MuJoCo XML definitions
+│   ├── lite6_hardware/    # Custom C++ ros2_control hardware interface for MuJoCo (Effort Mode)
+│   ├── lite6_hmi/         # PyQt5 Asynchronous GUI and SysId Engine
+│   ├── lite6_interfaces/  # Custom ROS2 Action for trajectory planning
+│   └── lite6_planner/     # Deterministic C++ Action Server (IK, Coal Collision, Ruckig OTG)
+├── Dockerfile              # Docker configuration
+├── run_docker.sh           # Container boot script
 └── README.md
 ```
 ### 🐳 Option A: Docker Deployment
