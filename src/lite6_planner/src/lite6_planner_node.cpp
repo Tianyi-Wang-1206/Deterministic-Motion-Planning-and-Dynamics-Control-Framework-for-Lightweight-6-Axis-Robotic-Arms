@@ -37,9 +37,7 @@ public:
     using FJT = control_msgs::action::FollowJointTrajectory;
 
     IndustrialPlannerNode() 
-    : Node("lite6_industrial_planner"),
-      otg_ptp_(0.001),
-      otg_cart_(0.001)
+    : Node("lite6_industrial_planner")
     {
         // Initialize Kinematics Engine (Now includes URDF, SRDF and Collision geometry)
         std::string pkg_path = ament_index_cpp::get_package_share_directory("lite6_description");
@@ -109,10 +107,6 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr js_sub_;
     rclcpp_action::Client<FJT>::SharedPtr jtc_client_;
     rclcpp_action::Server<IndustrialMotion>::SharedPtr action_server_;
-
-    // --- Pre-allocated Ruckig engines to eliminate dynamic memory footprint ---
-    ruckig::Ruckig<6> otg_ptp_;
-    ruckig::Ruckig<1> otg_cart_;
 
     // --- Joint displacement-based continuous collision sub-sampling ---
     bool is_trajectory_collision_free(const trajectory_msgs::msg::JointTrajectory& traj) {
@@ -290,6 +284,7 @@ private:
     // Helper: Extracts Ruckig generation logic for re-use
     trajectory_msgs::msg::JointTrajectory generate_ruckig_traj(const Eigen::VectorXd& start_q, const Eigen::VectorXd& target_q, double v_scale, double a_scale) 
     {
+        ruckig::Ruckig<6> otg_ptp(0.001); 
         ruckig::InputParameter<6> input;
         ruckig::OutputParameter<6> output;
 
@@ -313,7 +308,7 @@ private:
 
         ruckig::Result res;
         do {
-            res = otg_ptp_.update(input, output);
+            res = otg_ptp.update(input, output); 
             trajectory_msgs::msg::JointTrajectoryPoint pt;
             for (int i = 0; i < 6; ++i) {
                 pt.positions.push_back(output.new_position[i]);
@@ -388,10 +383,11 @@ private:
         bool trajectory_valid = false;
 
         const double dt_cycle = 0.001;
-        otg_cart_.delta_time = dt_cycle;
 
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
+
+            ruckig::Ruckig<1> otg_cart(dt_cycle); 
             
             ruckig::InputParameter<1> input;
             ruckig::OutputParameter<1> output;
@@ -414,7 +410,7 @@ private:
             ruckig::Result res;
             try {
                 do {
-                    res = otg_cart_.update(input, output);
+                    res = otg_cart.update(input, output); 
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
                     double dds = output.new_acceleration[0]; 
@@ -621,10 +617,11 @@ private:
         bool trajectory_valid = false;
 
         const double dt_cycle = 0.001;
-        otg_cart_.delta_time = dt_cycle;
 
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
+
+            ruckig::Ruckig<1> otg_cart(dt_cycle);
 
             ruckig::InputParameter<1> input;
             ruckig::OutputParameter<1> output;
@@ -647,7 +644,7 @@ private:
             ruckig::Result res;
             try {
                 do {
-                    res = otg_cart_.update(input, output);
+                    res = otg_cart.update(input, output); 
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
                     double dds = output.new_acceleration[0]; 
