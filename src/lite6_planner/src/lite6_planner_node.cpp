@@ -38,8 +38,8 @@ public:
 
     IndustrialPlannerNode() 
     : Node("lite6_industrial_planner"),
-      otg_ptp_(0.01),
-      otg_cart_(0.01)
+      otg_ptp_(0.001),
+      otg_cart_(0.001)
     {
         // Initialize Kinematics Engine (Now includes URDF, SRDF and Collision geometry)
         std::string pkg_path = ament_index_cpp::get_package_share_directory("lite6_description");
@@ -93,7 +93,7 @@ public:
             std::bind(&IndustrialPlannerNode::handle_cancel, this, _1),
             std::bind(&IndustrialPlannerNode::handle_accepted, this, _1));
 
-        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY (Analytical Joint Accel Enabled).");
+        RCLCPP_INFO(this->get_logger(), "Industrial Planner Node is ONLINE & READY.");
     }
 
 private:
@@ -334,7 +334,7 @@ private:
         return traj;
     }
 
-    // MoveL: Interpolates in Cartesian space and uses IK to find joint configurations along the path
+    // MoveL: Interpolates in Cartesian space and uses CLIK to find joint configurations
     trajectory_msgs::msg::JointTrajectory plan_line(std::shared_ptr<const IndustrialMotion::Goal> goal)
     {
         // Safely copy current joint states
@@ -351,6 +351,10 @@ private:
         pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
         pinocchio::SE3 pose_start = local_data.oMf[eef_frame_id_];
         pinocchio::SE3 pose_end(T_goal.block<3,3>(0,0), T_goal.block<3,1>(0,3));
+
+        // Define Start and End Quaternions outside the loop for SLERP interpolation
+        Eigen::Quaterniond q_start(pose_start.rotation());
+        Eigen::Quaterniond q_end(pose_end.rotation());
 
         // Calculate Cartesian Path Distances
         double d_trans = (pose_end.translation() - pose_start.translation()).norm();
@@ -383,6 +387,9 @@ private:
         const int MAX_RETRIES = 5;
         bool trajectory_valid = false;
 
+        const double dt_cycle = 0.001;
+        otg_cart_.delta_time = dt_cycle;
+
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
             
@@ -396,8 +403,13 @@ private:
             input.max_acceleration[0] = current_a_limit;
             input.max_jerk[0] = current_a_limit * 10.0;
 
-            std::array<double, 6> q_ref;
-            Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
+            Eigen::VectorXd q_current_integrated = start_q;
+            const double K_cart = 50.0; 
+
+            // Sub-sampling threshold for collision check to save planning time (check every ~2 degrees)
+            const double COLLISION_CHECK_THRESHOLD = 0.035; 
+            std::array<double, 6> last_checked_q;
+            for(int i=0; i<6; ++i) last_checked_q[i] = start_q[i];
 
             ruckig::Result res;
             try {
@@ -405,71 +417,91 @@ private:
                     res = otg_cart_.update(input, output);
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
-                    double dds = output.new_acceleration[0]; // Cartesian phase acceleration
+                    double dds = output.new_acceleration[0]; 
 
-                    // Interpolate Cartesian Pose
                     Eigen::Vector3d p_t = pose_start.translation() + s * (pose_end.translation() - pose_start.translation());
-                    Eigen::Quaterniond q_s(pose_start.rotation());
-                    Eigen::Quaterniond q_e(pose_end.rotation());
-                    Eigen::Matrix4d T_t = Eigen::Matrix4d::Identity();
-                    T_t.block<3,3>(0,0) = q_s.slerp(s, q_e).toRotationMatrix();
-                    T_t.block<3,1>(0,3) = p_t;
-
-                    // Inverse Kinematics
-                    std::vector<std::array<double, 6>> valid_sols;
-                    IKResult ik_res = kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true);
+                    Eigen::Quaterniond q_target(q_start.slerp(s, q_end));
                     
-                    if (ik_res != IKResult::SUCCESS) {
-                        if (ik_res == IKResult::ERR_LIMIT_OR_COLLISION) throw std::runtime_error("COLLISION: Path segment causes collision or joint limit violation.");
-                        if (ik_res == IKResult::ERR_SINGULARITY) throw std::runtime_error("Singularity: Trajectory passes through a singularity zone.");
-                        if (ik_res == IKResult::ERR_QUADRANT_JUMP) throw std::runtime_error("QUADRANT_JUMP: Prevented sudden joint flip.");
-                        throw std::runtime_error("NO_IK: Mathematical path lost.");
-                    }
-                    q_ref = valid_sols[0]; 
-
-                    // Differential Kinematics (Jacobian)
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
                     Eigen::Vector3d v_world = ds * (pose_end.translation() - pose_start.translation());
-                    Eigen::Vector3d w_world = ds * d_rot * (pose_start.rotation() * aa.axis());
-                    
+                    Eigen::Vector3d w_world = ds * d_rot * (q_start * aa.axis());
+                    Eigen::Vector3d a_world = dds * (pose_end.translation() - pose_start.translation());
+                    Eigen::Vector3d alpha_world = dds * d_rot * (q_start * aa.axis());
+
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_current_integrated);
+                    pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
+                    Eigen::Vector3d p_curr = local_data.oMf[eef_frame_id_].translation();
+                    Eigen::Matrix3d R_curr = local_data.oMf[eef_frame_id_].rotation();
+
+                    Eigen::Vector3d p_err = p_t - p_curr;
+                    Eigen::Matrix3d R_err_mat = q_target.toRotationMatrix() * R_curr.transpose();
+                    Eigen::AngleAxisd angle_axis_err(R_err_mat);
+                    Eigen::Vector3d w_err = angle_axis_err.axis() * angle_axis_err.angle();
+
+                    // Check tracking deviation
+                    if (p_err.norm() > 0.005 || w_err.norm() > 0.05) {
+                        throw std::runtime_error("NO_IK: Mathematical path lost. Target unreachable or requires impossible joint flip.");
+                    }
+
+                    Eigen::VectorXd V_cmd(6);
+                    V_cmd << (v_world + K_cart * p_err), (w_world + K_cart * w_err);
+
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_current_integrated, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
-                    // --- Adaptive Damped Least Squares using Manipulability ---
                     double manipulability = std::sqrt((J * J.transpose()).determinant());
+                    
+                    // Check Singularity
+                    std::array<double, 6> current_q_arr;
+                    for(int i=0; i<6; ++i) current_q_arr[i] = q_current_integrated[i];
+                    
+                    if (std::abs(kin_engine_.check_singularity(current_q_arr)) < kin_engine_.get_singularity_threshold()) {
+                        throw std::runtime_error("Singularity: Trajectory attempts to pass through a kinematic singularity zone.");
+                    }
+
                     double lambda = 0.0;
-                    double w_threshold = 0.04; // Safety threshold for Lite6 singularity proximity
+                    double w_threshold = 0.04;
                     if (manipulability < w_threshold) {
                         lambda = 0.05 * std::pow(1.0 - (manipulability / w_threshold), 2);
                     }
-
                     Eigen::MatrixXd J_dls = J.transpose() * (J * J.transpose() + lambda * lambda * Eigen::MatrixXd::Identity(6,6)).inverse();
+
+                    Eigen::VectorXd dq = J_dls * V_cmd;
                     
-                    Eigen::VectorXd V_spatial(6);
-                    V_spatial << v_world, w_world;
-                    Eigen::VectorXd dq = J_dls * V_spatial;
-
-                    // --- Pinocchio Analytical Joint Acceleration Solving ---
-                    // Compute kinematics under actual position & estimated velocity with zero ddq
                     Eigen::VectorXd ddq_zero = Eigen::VectorXd::Zero(6);
-                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_eig, dq, ddq_zero);
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_current_integrated, dq, ddq_zero);
+                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+                    
+                    Eigen::VectorXd A_cmd(6);
+                    A_cmd << a_world, alpha_world; 
+                    Eigen::VectorXd ddq = J_dls * (A_cmd - J_dot_dq);
 
-                    // getFrameAcceleration with ddq=0 returns spatial drift acceleration (J_dot * dq)
-                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(
-                        kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+                    q_current_integrated = q_current_integrated + dq * dt_cycle + 0.5 * ddq * dt_cycle * dt_cycle;
 
-                    // Map Cartesian phase acceleration to desired spatial acceleration
-                    Eigen::Vector3d a_world = dds * (pose_end.translation() - pose_start.translation());
-                    Eigen::Vector3d alpha_world = dds * d_rot * (pose_start.rotation() * aa.axis());
-                    Eigen::VectorXd A_des(6);
-                    A_des << a_world, alpha_world;
+                    // Check Limits and Collisions
+                    double max_diff = 0.0;
+                    for (int i = 0; i < 6; ++i) {
+                        current_q_arr[i] = q_current_integrated[i];
+                        max_diff = std::max(max_diff, std::abs(current_q_arr[i] - last_checked_q[i]));
+                        
+                        // Strict Joint Limit Check
+                        if (current_q_arr[i] < kin_engine_.get_joint_limits()[i].min_pos || 
+                            current_q_arr[i] > kin_engine_.get_joint_limits()[i].max_pos) {
+                            throw std::runtime_error("COLLISION: Joint limit violation detected during MoveL.");
+                        }
+                    }
 
-                    // Analytical calculation: ddq = J_dls * (A_des - J_dot_dq) -> Perfect math profile
-                    Eigen::VectorXd ddq = J_dls * (A_des - J_dot_dq);
+                    // Sparse Collision Check (Saves computation time)
+                    if (max_diff >= COLLISION_CHECK_THRESHOLD || res != ruckig::Result::Working) {
+                        if (kin_engine_.check_collision(current_q_arr)) {
+                            throw std::runtime_error("COLLISION: Path segment causes physical collision.");
+                        }
+                        last_checked_q = current_q_arr;
+                    }
 
+                    // Populate Trajectory Point
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
-                        pt.positions.push_back(q_ref[i]);
+                        pt.positions.push_back(q_current_integrated[i]);
                         pt.velocities.push_back(dq(i));
                         pt.accelerations.push_back(ddq(i));
                     }
@@ -479,10 +511,10 @@ private:
                     output.pass_to_input(input);
                 } while (res == ruckig::Result::Working);
             } catch (const std::exception& e) {
-                throw; 
+                throw; // Rethrow to be caught by the external exception handler in execute()
             }
 
-            // Strict Physical Limits Violation Check
+            // Strict Physical Limits Violation Check for Time-Scaling
             double max_violation_ratio = 0.0;
             for (const auto& pt : traj.points) {
                 for (int i = 0; i < 6; ++i) {
@@ -516,9 +548,10 @@ private:
         return traj;
     }
 
-    // MoveC: Plan a circular path through three points in space
+    // MoveC: Plan a circular path through three points in space using CLIK integration
     trajectory_msgs::msg::JointTrajectory plan_circle(std::shared_ptr<const IndustrialMotion::Goal> goal)
     {
+        // Safely copy current joint states
         Eigen::VectorXd start_q;
         {
             std::shared_lock<std::shared_mutex> lock(state_mutex_);
@@ -538,7 +571,7 @@ private:
         // Calculate Circle Geometry
         Eigen::Vector3d v1 = p2 - p1, v2 = p3 - p1;
         Eigen::Vector3d n = v1.cross(v2);
-        if (n.norm() < 1e-5) throw std::runtime_error("Points are collinear, cannot form a circle.");
+        if (n.norm() < 1e-5) throw std::runtime_error("ERR_INVALID_INPUT: Points are collinear, cannot form a circle.");
         n.normalize();
 
         double a = (p3 - p2).norm(), b = (p1 - p3).norm(), c = (p2 - p1).norm();
@@ -587,6 +620,9 @@ private:
         const int MAX_RETRIES = 5;
         bool trajectory_valid = false;
 
+        const double dt_cycle = 0.001;
+        otg_cart_.delta_time = dt_cycle;
+
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             traj.points.clear();
 
@@ -600,8 +636,13 @@ private:
             input.max_acceleration[0] = current_a_limit;
             input.max_jerk[0] = current_a_limit * 10.0;
 
-            std::array<double, 6> q_ref;
-            Eigen::VectorXd::Map(&q_ref[0], 6) = start_q;
+            Eigen::VectorXd q_current_integrated = start_q;
+            const double K_cart = 50.0;
+
+            // Sub-sampling threshold for collision check (~2 degrees)
+            const double COLLISION_CHECK_THRESHOLD = 0.035; 
+            std::array<double, 6> last_checked_q;
+            for(int i=0; i<6; ++i) last_checked_q[i] = start_q[i];
 
             ruckig::Result res;
             try {
@@ -609,72 +650,101 @@ private:
                     res = otg_cart_.update(input, output);
                     double s = output.new_position[0];
                     double ds = output.new_velocity[0];
-                    double dds = output.new_acceleration[0]; // Cartesian phase acceleration
-                    double current_theta = s * total_angle;
-
-                    // Interpolate
-                    Eigen::Vector3d p_t = center + radius * std::cos(current_theta) * X_dir + radius * std::sin(current_theta) * Y_dir;
-                    Eigen::Matrix4d T_t = Eigen::Matrix4d::Identity();
-                    T_t.block<3,3>(0,0) = q_start.slerp(s, q_end).toRotationMatrix();
-                    T_t.block<3,1>(0,3) = p_t;
-
-                    // IK
-                    std::vector<std::array<double, 6>> valid_sols;
-                    IKResult ik_res = kin_engine_.solve_optimal_ik(T_t, q_ref, valid_sols, true);
+                    double dds = output.new_acceleration[0]; 
                     
-                    if (ik_res != IKResult::SUCCESS) {
-                        if (ik_res == IKResult::ERR_LIMIT_OR_COLLISION) throw std::runtime_error("COLLISION: Path segment causes collision.");
-                        if (ik_res == IKResult::ERR_SINGULARITY) throw std::runtime_error("Singularity: Trajectory attempts to pass through a singularity zone.");
-                        if (ik_res == IKResult::ERR_QUADRANT_JUMP) throw std::runtime_error("QUADRANT_JUMP: Prevented sudden joint flip.");
-                        throw std::runtime_error("NO_IK: Mathematical path lost.");
-                    }
-                    q_ref = valid_sols[0]; 
-
-                    // Differential Kinematics
-                    Eigen::VectorXd q_eig = Eigen::Map<Eigen::VectorXd>(q_ref.data(), 6);
+                    double current_theta = s * total_angle;
                     double dtheta_dt = ds * total_angle;
                     double ddtheta_dt = dds * total_angle;
 
+                    // Ideal Feedforward Pose (Circle)
+                    Eigen::Vector3d p_t = center + radius * std::cos(current_theta) * X_dir + radius * std::sin(current_theta) * Y_dir;
+                    Eigen::Quaterniond q_target(q_start.slerp(s, q_end));
+
+                    // Ideal Feedforward Twist & Spatial Acceleration
                     Eigen::Vector3d v_world = dtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir);
                     Eigen::Vector3d w_world = ds * d_rot * (q_start * aa.axis());
 
+                    Eigen::Vector3d a_world = ddtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir) +
+                                              (dtheta_dt * dtheta_dt) * (-radius * std::cos(current_theta) * X_dir - radius * std::sin(current_theta) * Y_dir);
+                    Eigen::Vector3d alpha_world = dds * d_rot * (q_start * aa.axis());
+
+                    // Current Integrated Pose
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_current_integrated);
+                    pinocchio::updateFramePlacements(kin_engine_.get_pin_model(), local_data);
+                    Eigen::Vector3d p_curr = local_data.oMf[eef_frame_id_].translation();
+                    Eigen::Matrix3d R_curr = local_data.oMf[eef_frame_id_].rotation();
+
+                    // Spatial Error Computation (CLIK Feedback)
+                    Eigen::Vector3d p_err = p_t - p_curr;
+                    Eigen::Matrix3d R_err_mat = q_target.toRotationMatrix() * R_curr.transpose();
+                    Eigen::AngleAxisd angle_axis_err(R_err_mat);
+                    Eigen::Vector3d w_err = angle_axis_err.axis() * angle_axis_err.angle();
+
+                    // Check tracking deviation
+                    if (p_err.norm() > 0.005 || w_err.norm() > 0.05) {
+                        throw std::runtime_error("NO_IK: Mathematical path lost. Target unreachable or requires impossible joint flip.");
+                    }
+
+                    // Command Twist
+                    Eigen::VectorXd V_cmd(6);
+                    V_cmd << (v_world + K_cart * p_err), (w_world + K_cart * w_err);
+
+                    // Compute Jacobian & DLS
                     pinocchio::Data::Matrix6x J(6, 6);
-                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_eig, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
+                    pinocchio::computeFrameJacobian(kin_engine_.get_pin_model(), local_data, q_current_integrated, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED, J);
                     
-                    // --- Adaptive Damped Least Squares using Manipulability ---
+                    // Check Singularity
+                    std::array<double, 6> current_q_arr;
+                    for(int i=0; i<6; ++i) current_q_arr[i] = q_current_integrated[i];
+                    if (std::abs(kin_engine_.check_singularity(current_q_arr)) < kin_engine_.get_singularity_threshold()) {
+                        throw std::runtime_error("Singularity: Trajectory attempts to pass through a kinematic singularity zone.");
+                    }
+
                     double manipulability = std::sqrt((J * J.transpose()).determinant());
                     double lambda = 0.0;
                     double w_threshold = 0.04;
                     if (manipulability < w_threshold) {
                         lambda = 0.05 * std::pow(1.0 - (manipulability / w_threshold), 2);
                     }
-
                     Eigen::MatrixXd J_dls = J.transpose() * (J * J.transpose() + lambda * lambda * Eigen::MatrixXd::Identity(6,6)).inverse();
+
+                    // Differential Kinematics
+                    Eigen::VectorXd dq = J_dls * V_cmd;
                     
-                    Eigen::VectorXd V_spatial(6); V_spatial << v_world, w_world;
-                    Eigen::VectorXd dq = J_dls * V_spatial;
-
-                    // --- Pinocchio Analytical Joint Acceleration Solving ---
                     Eigen::VectorXd ddq_zero = Eigen::VectorXd::Zero(6);
-                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_eig, dq, ddq_zero);
+                    pinocchio::forwardKinematics(kin_engine_.get_pin_model(), local_data, q_current_integrated, dq, ddq_zero);
+                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+                    
+                    Eigen::VectorXd A_cmd(6);
+                    A_cmd << a_world, alpha_world;
+                    Eigen::VectorXd ddq = J_dls * (A_cmd - J_dot_dq);
 
-                    // getFrameAcceleration with ddq=0 returns J_dot * dq
-                    Eigen::VectorXd J_dot_dq = pinocchio::getFrameAcceleration(
-                        kin_engine_.get_pin_model(), local_data, eef_frame_id_, pinocchio::LOCAL_WORLD_ALIGNED).toVector();
+                    // Absolute numerical integration (Euler)
+                    q_current_integrated = q_current_integrated + dq * dt_cycle + 0.5 * ddq * dt_cycle * dt_cycle;
 
-                    // Calculate analytical desired spatial acceleration for circular motion
-                    Eigen::Vector3d a_world = ddtheta_dt * (-radius * std::sin(current_theta) * X_dir + radius * std::cos(current_theta) * Y_dir) +
-                                              (dtheta_dt * dtheta_dt) * (-radius * std::cos(current_theta) * X_dir - radius * std::sin(current_theta) * Y_dir);
-                    Eigen::Vector3d alpha_world = dds * d_rot * (q_start * aa.axis());
-                    Eigen::VectorXd A_des(6);
-                    A_des << a_world, alpha_world;
+                    // Check Limits and Collisions
+                    double max_diff = 0.0;
+                    for (int i = 0; i < 6; ++i) {
+                        current_q_arr[i] = q_current_integrated[i];
+                        max_diff = std::max(max_diff, std::abs(current_q_arr[i] - last_checked_q[i]));
+                        
+                        if (current_q_arr[i] < kin_engine_.get_joint_limits()[i].min_pos || 
+                            current_q_arr[i] > kin_engine_.get_joint_limits()[i].max_pos) {
+                            throw std::runtime_error("COLLISION: Joint limit violation detected during MoveC.");
+                        }
+                    }
 
-                    // Analytical calculation: ddq = J_dls * (A_des - J_dot_dq) -> Perfect math profile
-                    Eigen::VectorXd ddq = J_dls * (A_des - J_dot_dq);
+                    if (max_diff >= COLLISION_CHECK_THRESHOLD || res != ruckig::Result::Working) {
+                        if (kin_engine_.check_collision(current_q_arr)) {
+                            throw std::runtime_error("COLLISION: Path segment causes physical collision.");
+                        }
+                        last_checked_q = current_q_arr;
+                    }
 
+                    // Populate Trajectory Point
                     trajectory_msgs::msg::JointTrajectoryPoint pt;
                     for (int i = 0; i < 6; ++i) {
-                        pt.positions.push_back(q_ref[i]);
+                        pt.positions.push_back(q_current_integrated[i]);
                         pt.velocities.push_back(dq(i));
                         pt.accelerations.push_back(ddq(i));
                     }
@@ -687,7 +757,7 @@ private:
                 throw; 
             }
 
-            // Strict Physical Limits Violation Check
+            // Strict Physical Limits Violation Check for Time-Scaling
             double max_violation_ratio = 0.0;
             for (const auto& pt : traj.points) {
                 for (int i = 0; i < 6; ++i) {
