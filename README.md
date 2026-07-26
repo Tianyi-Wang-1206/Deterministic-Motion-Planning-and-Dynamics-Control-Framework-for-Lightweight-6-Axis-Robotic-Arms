@@ -133,7 +133,7 @@ flowchart TD
 
     %% 1. Upstream Layer
     subgraph L1 [Upper Layer: Trajectory Interpolation]
-        JTC[ROS 2 Joint Trajectory Controller]:::jtc
+        JTC[ROS 2<br/>Joint Trajectory Controller]:::jtc
         JTC -- reference_interfaces --> Q_T([q_target]):::data
         JTC -- reference_interfaces --> DQ_T([dq_target]):::data
         JTC -- reference_interfaces --> DDQ_T([ddq_target]):::data
@@ -147,7 +147,7 @@ flowchart TD
 
     %% 3. State Estimator (Zero-Lag Observer)
     subgraph L3 [State Estimation - Zero Lag Observer]
-        KF["1D Kalman Filter (per joint)<hr/>Predict: x = F*x + B * ddq_target<br/>Update: x = x + K * (q_measured - x_pos)"]:::calc
+        KF["1D Kalman Filter (per joint)<hr/>Predict:<br/>x = F*x + B * ddq_target<br/>Update:<br/>x = x + K * (q_measured - x_pos)"]:::calc
         Q_M --> KF
         DDQ_T -. Acceleration Injection .-> KF
         KF --> Q_F([q_filtered]):::data
@@ -164,17 +164,17 @@ flowchart TD
 
     %% 5. Control Law & Dynamics
     subgraph L5 [Computed Torque Control Law - 1000Hz]
-        ERR_Q --> PD["PD + Feedforward<br/>a_d = ddq_target + Kp*e + Kv*de"]:::calc
+        ERR_Q --> PD["PD + Feedforward<br/>a_d = ddq_target + Kp*e<br/>+ Kv*de"]:::calc
         ERR_DQ --> PD
         DDQ_T --> PD
 
-        PD --> RNEA["Pinocchio RNEA<br/>Inverse Dynamics: M(q)*a_d + C(q,dq)*dq + G(q)"]:::calc
+        PD --> RNEA["Pinocchio RNEA<br/>Inverse Dynamics: M(q)*a_d<br/>+ C(q,dq)*dq + G(q)"]:::calc
         Q_F --> RNEA
         DQ_F --> RNEA
 
         PD --> ARM["Rotor Inertia Compensation<br/>tau_arm = Armature * a_d"]:::calc
 
-        DQ_F --> FRIC["Friction Compensation<hr/>Viscous: F_v * dq_filtered<br/>Coulomb: F_c * tanh(slope * (dq_target + 5*e))"]:::calc
+        DQ_F --> FRIC["Friction Compensation<hr/>Viscous: F_v * dq_filtered<br/>Coulomb: F_c * tanh(slope *<br/>(dq_target + 5*e))"]:::calc
         DQ_T --> FRIC
         ERR_Q --> FRIC
 
@@ -183,7 +183,7 @@ flowchart TD
         FRIC --> SUM
 
         SUM --> TAU_RAW([tau_raw]):::data
-        TAU_RAW --> SAT["Torque Saturation<br/>clamp(-max_effort, max_effort)"]:::calc
+        TAU_RAW --> SAT["Torque Saturation<br/>clamp(-max_effort,<br/>max_effort)"]:::calc
     end
 
     %% 6. Hardware Output
