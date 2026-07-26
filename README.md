@@ -147,7 +147,7 @@ flowchart TD
 
     %% 3. State Estimator (Zero-Lag Observer)
     subgraph L3 [State Estimation - Zero Lag Observer]
-        KF["1D Kalman Filter (per joint)<hr/>Predict:<br/>x = F*x + B * ddq_target<br/>Update:<br/>x = x + K * (q_measured - x_pos)"]:::calc
+        KF["1D Kalman Filter (per joint)<hr/>Predict:<br/>x = F*x + B * ddq_target<br/>Update:<br/>x = x + K * (q_measured -<br/>x_pos)"]:::calc
         Q_M --> KF
         DDQ_T -. Acceleration Injection .-> KF
         KF --> Q_F([q_filtered]):::data
